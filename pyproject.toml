@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voyager-frontend"
+version = "0.1.0"
+description = "VoyagerAI Istanbul chatbot-ui (Checkpoint Phase 4 D.2B). A self-contained Streamlit frontend -- never imports root packages or another submodule's code, only talks to agent-system-a over HTTP/SSE (phase6/api_client.py). This file exists so `phase6` is a genuinely installed package (`pip install .` in the Docker image, `pip install -e .` for local dev/test) -- the declared mechanism this project requires in place of any sys.path/PYTHONPATH mutation at runtime."
+requires-python = ">=3.12"
+
+# Third-party runtime dependencies are declared in requirements.in
+# (phase6/requirements.in), matching this repository's existing
+# per-service convention -- never duplicated here.
+dependencies = []
+
+[tool.setuptools]
+packages = ["phase6"]
