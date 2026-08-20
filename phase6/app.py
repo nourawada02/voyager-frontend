@@ -41,6 +41,8 @@ def _project_today() -> date:
 
 from phase6 import results as result_helpers
 from phase6.api_client import (
+    ChatTurnResult,
+    SessionSummary,
     SSEEvent,
     SystemAClient,
     SystemAConfigurationError,
@@ -95,6 +97,12 @@ def _init_session_state() -> None:
         # from the page the instant a run_id exists, so it cannot be
         # re-submitted by a later, unrelated rerun).
         "pending_idempotency_key": str(uuid.uuid4()),
+        # Hybrid Chat C.1: the "Continue planning" chat section's own
+        # state -- an ordered transcript, the session's current preferred
+        # language for chat replies (seeded from the trip form's own
+        # language field once a trip is submitted, see main()), and a
+        # duplicate-submission guard.
+        "chat_messages": [], "chat_preferred_language": "en", "chat_turn_in_progress": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -104,10 +112,142 @@ def _init_session_state() -> None:
 def _reset_for_new_trip() -> None:
     """Retrying always creates a brand-new run -- this only clears local
     session state, it never mutates or deletes the completed run's own
-    server-side history."""
-    for key in ("run_id", "session_id", "last_event_id", "event_log", "trip_request_submitted"):
-        st.session_state[key] = None if key != "event_log" else []
+    server-side history. Hybrid Chat C.1: also explicitly clears the chat
+    transcript and its own in-progress flag -- "Plan a new trip" starts a
+    genuinely fresh session on both the trip and the chat side, never
+    carrying a conversation over to an unrelated new trip. Persistent-
+    history correction: also clears the URL's own session_id/run_id query
+    params, so a stale link left over from the old session never silently
+    restores it on a later visit -- the previous session's own transcript
+    remains fully retrievable server-side by its real session/run ids
+    (§5's history API), just no longer reachable through THIS browser
+    tab's URL."""
+    for key in ("run_id", "session_id", "last_event_id", "event_log", "trip_request_submitted", "chat_messages"):
+        st.session_state[key] = None if key not in ("event_log", "chat_messages") else []
     st.session_state["pending_idempotency_key"] = str(uuid.uuid4())
+    st.session_state["chat_preferred_language"] = "en"
+    st.session_state["chat_turn_in_progress"] = False
+    st.query_params.clear()
+
+
+def _sync_query_params() -> None:
+    """Persistent-history correction: mirrors the active session_id/run_id
+    into the browser's own URL query params -- the one durable reference
+    that survives a full `chatbot-ui` container restart (which wipes
+    every in-memory `st.session_state` for every browser tab), so a
+    reload of the same URL can rehydrate the active session instead of
+    landing back on a bare form with no memory of it."""
+    if st.session_state["session_id"] and st.session_state["run_id"]:
+        st.query_params["session_id"] = st.session_state["session_id"]
+        st.query_params["run_id"] = st.session_state["run_id"]
+
+
+def _restore_session_from_query_params(client: SystemAClient) -> None:
+    """Runs once per fresh session_state (guarded by the `run_id is None`
+    check, so an already-active in-memory session is never overwritten by
+    a stale/concurrent query param on a later rerun). Never trusts the
+    query params blindly: the restored run's own `session_id` must match
+    what the URL claims, or nothing is restored -- a tampered/mismatched
+    URL just falls through to the ordinary empty-form experience, never a
+    wrong session's data."""
+    if st.session_state["run_id"] is not None:
+        return
+    qp_run_id = st.query_params.get("run_id")
+    qp_session_id = st.query_params.get("session_id")
+    if not qp_run_id or not qp_session_id:
+        return
+    try:
+        current = client.get_run(qp_run_id)
+    except (SystemAConnectionError, SystemAResponseError):
+        return  # not fatal -- the user just sees a fresh form this time
+    if current.session_id != qp_session_id:
+        return
+    st.session_state["run_id"] = qp_run_id
+    st.session_state["session_id"] = qp_session_id
+    st.session_state["trip_request_submitted"] = current.trip_request
+    try:
+        history = client.get_chat_history(qp_session_id, qp_run_id)
+        st.session_state["chat_messages"] = [{"role": t.role, "content": t.content} for t in history]
+    except (SystemAConnectionError, SystemAResponseError):
+        pass  # transcript restoration is best-effort -- the run itself still resumes
+
+
+# --- Hybrid Chat C.2: recent-session sidebar ------------------------------------------------
+#
+# A LOCAL, SINGLE-USER demo feature: any browser tab pointed at this
+# chatbot-ui instance can list and switch into any session this SQLite
+# database has ever stored -- there is no per-user ownership boundary
+# anywhere in this checkpoint (matching every other Phase 4 checkpoint's
+# explicit "auth is out of scope" stance). A real multi-user production
+# deployment would need to add authenticated session ownership (a user
+# identity attached to each session_id, and every listing/switch/history
+# call scoped to the caller's own sessions) BEFORE this sidebar could be
+# exposed beyond a trusted local demo -- deliberately not built here.
+
+
+def _switch_to_session(client: SystemAClient, session_id: str, run_id: str) -> bool:
+    """Loads the authoritative run + FULL persisted transcript for an
+    existing session and makes it the active one. Every relevant
+    session_state key is fully REPLACED, never appended/merged -- switching
+    A -> B -> A always ends with exactly A's own real transcript, never a
+    mix of A's and B's messages. Returns True on success (caller reruns),
+    False if the switch could not complete (caller shows a warning and
+    leaves the previously-active trip untouched)."""
+    try:
+        current = client.get_run(run_id)
+    except (SystemAConnectionError, SystemAResponseError):
+        return False
+    st.session_state["run_id"] = current.run_id
+    st.session_state["session_id"] = current.session_id
+    st.session_state["last_event_id"] = None
+    st.session_state["event_log"] = []
+    st.session_state["trip_request_submitted"] = current.trip_request
+    st.session_state["chat_turn_in_progress"] = False
+    st.session_state["pending_idempotency_key"] = str(uuid.uuid4())
+    if current.trip_request:
+        language = (current.trip_request.get("preferences") or {}).get("language")
+        if language:
+            st.session_state["chat_preferred_language"] = language
+    try:
+        history = client.get_chat_history(current.session_id, current.run_id)
+        st.session_state["chat_messages"] = [{"role": t.role, "content": t.content} for t in history]
+    except (SystemAConnectionError, SystemAResponseError):
+        st.session_state["chat_messages"] = []  # transcript restoration is best-effort -- the switch itself still succeeds
+    _sync_query_params()
+    return True
+
+
+def _short_session_suffix(session_id: str) -> str:
+    return session_id[-6:] if len(session_id) >= 6 else session_id
+
+
+def _render_sidebar(client: SystemAClient) -> None:
+    with st.sidebar:
+        st.subheader("Recent trips")
+        try:
+            summaries, _total = client.list_sessions(limit=20, offset=0)
+        except (SystemAConnectionError, SystemAResponseError):
+            # Requirement: a listing failure degrades safely -- a small
+            # warning, and the currently-active trip (if any) is left
+            # completely untouched.
+            st.warning("Could not load recent trips right now.")
+            return
+
+        if not summaries:
+            st.caption("No trips yet — plan one to see it here.")
+            return
+
+        active_session_id = st.session_state.get("session_id")
+        for summary in summaries:
+            is_active = summary.session_id == active_session_id
+            icon, _label = STATUS_LABELS.get(summary.latest_run_status, ("ℹ️", summary.latest_run_status))
+            button_label = f"{'●' if is_active else '○'} {summary.title}"
+            if st.button(button_label, key=f"session_nav_{summary.session_id}", width="stretch", disabled=is_active):
+                if _switch_to_session(client, summary.session_id, summary.latest_run_id):
+                    st.rerun()
+                else:
+                    st.warning("Could not switch to that trip right now.")
+            st.caption(f"{icon} {summary.latest_run_status} · updated {summary.updated_at} · …{_short_session_suffix(summary.session_id)}")
 
 
 # --- top-level health / mode banner -------------------------------------------------------
@@ -665,6 +805,106 @@ def _render_terminal_state(status: str, result: dict) -> None:
     _render_results(result, st.session_state.get("trip_request_submitted"))
 
 
+# --- Hybrid Chat C.1: "Continue planning" chat section -----------------------------------
+
+
+def _describe_patch_changes(previous_trip_request: Optional[dict], trip_patch: Optional[dict]) -> list[str]:
+    """A concise, deterministic summary of which top-level trip fields
+    actually changed -- never a raw JSON diff dump. `trip_patch` (when
+    present) already carries each field's FULLY merged new value
+    (`phase4.chat_models.apply_patch_to_trip_request` merges server-side),
+    so a plain top-level inequality check is correct here, not a partial/
+    shallow-merge bug."""
+    if not trip_patch:
+        return []
+    previous = previous_trip_request or {}
+    return [field for field, value in trip_patch.items() if previous.get(field) != value]
+
+
+def _apply_chat_turn_result(result: ChatTurnResult) -> None:
+    st.session_state["chat_messages"].append({"role": "assistant", "content": result.assistant_message})
+    if result.response_language:
+        st.session_state["chat_preferred_language"] = result.response_language
+
+    if result.requires_new_run and result.new_run_id:
+        # Hybrid Chat C.1 §7: same session ID, a genuinely new run, and
+        # the dashboard now tracks that new run's own progress/result --
+        # the event log is reset because it belongs to the PREVIOUS run
+        # (event sequence numbers are only unique per run_id).
+        st.session_state["run_id"] = result.new_run_id
+        st.session_state["last_event_id"] = None
+        st.session_state["event_log"] = []
+        if result.trip_patch:
+            merged_trip_request = dict(st.session_state.get("trip_request_submitted") or {})
+            merged_trip_request.update(result.trip_patch)
+            st.session_state["trip_request_submitted"] = merged_trip_request
+        _sync_query_params()
+
+    if result.intent == "reset_trip":
+        _reset_for_new_trip()
+
+
+def _render_chat_section(client: SystemAClient, run_id: str, session_id: str) -> None:
+    st.divider()
+    st.subheader("💬 Continue planning")
+    st.caption(
+        "Ask why something was recommended, or ask to change your budget, dates, travelers, pace, "
+        "interests, or preferred language — without starting over."
+    )
+
+    for message in st.session_state["chat_messages"]:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+
+    prompt = st.chat_input(
+        "Ask a question or request a change…", disabled=st.session_state["chat_turn_in_progress"]
+    )
+    if not prompt:
+        return
+
+    st.session_state["chat_messages"].append({"role": "user", "content": prompt})
+    st.session_state["chat_turn_in_progress"] = True
+    with st.chat_message("user"):
+        st.write(prompt)
+
+    previous_trip_request = st.session_state.get("trip_request_submitted")
+    try:
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                result = client.create_chat_turn(
+                    session_id=session_id, run_id=st.session_state["run_id"],
+                    user_message=prompt, preferred_language=st.session_state["chat_preferred_language"],
+                )
+            st.write(result.assistant_message)
+            changed_fields = _describe_patch_changes(previous_trip_request, result.trip_patch)
+            if changed_fields:
+                st.caption(f"Updated: {', '.join(changed_fields)}")
+            if result.requires_new_run and result.new_run_id:
+                st.caption(f"Replanning with your updated trip — new run `{result.new_run_id}`…")
+            for warning in result.warnings:
+                st.caption(f"⚠️ {warning}")
+        _apply_chat_turn_result(result)
+    except SystemAConnectionError:
+        st.session_state["chat_messages"].append(
+            {"role": "assistant", "content": "Could not reach agent-system-a. Please try again."}
+        )
+    except SystemAResponseError as exc:
+        # Persistent-history/grounding correction §10/§12: a genuine
+        # provider outage (backend-mapped 503 PROVIDER_UNAVAILABLE) gets
+        # its own truthful, specific message -- never lumped in with an
+        # ordinary validation/response error under the generic phrasing
+        # below, and never displayed as if the user's own message were
+        # somehow at fault.
+        if exc.error_code == "PROVIDER_UNAVAILABLE":
+            message = "The AI assistant is temporarily unavailable right now. Please try again in a moment."
+        else:
+            message = f"Could not process that message: {exc}"
+        st.session_state["chat_messages"].append({"role": "assistant", "content": message})
+    finally:
+        st.session_state["chat_turn_in_progress"] = False
+    st.rerun()
+
+
 # --- run section (progress + terminal) -----------------------------------------------------
 
 
@@ -690,6 +930,13 @@ def _render_run_section(client: SystemAClient) -> None:
     if current.status not in ("pending", "running"):
         _render_progress_log()
         _render_terminal_state(current.status, current.result or {})
+        # Hybrid Chat C.1 §2/§7: the chat section appears only below an
+        # ACTUAL rendered dashboard -- `_render_terminal_state` itself
+        # returns early (renders no dashboard) for status == "failed", so
+        # chat is withheld there too rather than inviting questions about
+        # a plan that was never produced.
+        if current.status != "failed":
+            _render_chat_section(client, run_id, st.session_state["session_id"])
         return
 
     with header_col:
@@ -722,6 +969,9 @@ def main() -> None:
     if not _render_health_banner(client):
         return
 
+    _restore_session_from_query_params(client)
+    _render_sidebar(client)
+
     if st.session_state["run_id"] is None:
         form_result = _render_trip_form()
         if form_result is None:
@@ -741,6 +991,11 @@ def main() -> None:
         st.session_state["run_id"] = created.run_id
         st.session_state["session_id"] = created.session_id
         st.session_state["trip_request_submitted"] = form_result["trip_request"]
+        # Hybrid Chat C.1: seed the chat section's own language from the
+        # trip form's language field, so a first chat reply matches the
+        # language the user already chose without them having to state it.
+        st.session_state["chat_preferred_language"] = form_result["trip_request"]["preferences"]["language"]
+        _sync_query_params()
         st.rerun()
         return
 

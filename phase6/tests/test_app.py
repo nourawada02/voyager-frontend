@@ -31,6 +31,18 @@ class _JsonResponse:
         return self.text.encode()
 
 
+# Hybrid Chat C.2: the recent-session sidebar issues exactly ONE extra GET
+# (`/v1/chat/sessions?...`, never one per entry) on every render pass --
+# every hand-written `_fake_get` closure in this file must answer it (an
+# empty list is the safe, neutral default; tests that specifically
+# exercise the sidebar override this explicitly).
+_EMPTY_SESSION_LIST_BODY = {"sessions": [], "total": 0, "limit": 20, "offset": 0}
+
+
+def _is_session_list_request(url: str) -> bool:
+    return "/v1/chat/sessions?" in url or url.endswith("/v1/chat/sessions")
+
+
 def _health_ok(mode: str = "fixture", run_status: str = "completed"):
     # `run_status` defaults to a TERMINAL status: AppTest actually drives
     # `st.rerun()` calls to completion within one `.run()` invocation
@@ -44,6 +56,8 @@ def _health_ok(mode: str = "fixture", run_status: str = "completed"):
     def _fake_get(url, timeout=None):
         if url.endswith("/health"):
             return _JsonResponse(200, {"status": "ok", "service": "agent-system-a", "mode": mode})
+        if _is_session_list_request(url):
+            return _JsonResponse(200, _EMPTY_SESSION_LIST_BODY)
         if "/v1/runs/" in url:
             return _JsonResponse(200, {
                 "run_id": "run-1", "session_id": "session-1", "status": run_status,
@@ -516,6 +530,8 @@ def _run_usd_trip_and_collect_text(monkeypatch, tab_index: int):
     def _fake_get(url, timeout=None):
         if url.endswith("/health"):
             return _JsonResponse(200, {"status": "ok", "service": "agent-system-a", "mode": "fixture"})
+        if _is_session_list_request(url):
+            return _JsonResponse(200, _EMPTY_SESSION_LIST_BODY)
         if "/v1/runs/" in url:
             return _JsonResponse(200, {
                 "run_id": "run-1", "session_id": "session-1", "status": "completed",
@@ -627,6 +643,8 @@ def test_each_terminal_status_renders_correctly_and_stops_polling(monkeypatch, t
     def _fake_get(url, timeout=None):
         if url.endswith("/health"):
             return _JsonResponse(200, {"status": "ok", "service": "agent-system-a", "mode": "fixture"})
+        if _is_session_list_request(url):
+            return _JsonResponse(200, _EMPTY_SESSION_LIST_BODY)
         if "/v1/runs/" in url:
             return _JsonResponse(200, {
                 "run_id": "run-1", "session_id": "session-1", "status": terminal_status,
@@ -660,3 +678,520 @@ def test_all_client_timeouts_are_bounded_never_none():
     for attr in ("connect", "read", "write", "pool"):
         value = getattr(client._sse_timeout, attr)
         assert value is not None and value > 0, f"sse_timeout.{attr} must be a bounded positive number, got {value!r}"
+
+
+# --- Hybrid Chat C.1: "Continue planning" chat section ------------------------------------
+
+
+def _run_to_completed_dashboard(monkeypatch, chat_post_handler=None):
+    """Drives the app from a bare load through form submission to a
+    COMPLETED run with a rendered dashboard -- the precondition for the
+    chat section to ever appear (§2/§7: chat only appears below an
+    already-generated dashboard, never replacing it)."""
+    result = {"status": "success", "observations": [], "warnings": [], "narrative": "A relaxing 5-day trip."}
+
+    def _fake_get(url, timeout=None):
+        if url.endswith("/health"):
+            return _JsonResponse(200, {"status": "ok", "service": "agent-system-a", "mode": "real"})
+        if _is_session_list_request(url):
+            return _JsonResponse(200, _EMPTY_SESSION_LIST_BODY)
+        if "/v1/runs/" in url:
+            return _JsonResponse(200, {
+                "run_id": "run-1", "session_id": "session-1", "status": "completed",
+                "created_at": "t", "updated_at": "t", "result": result,
+            })
+        raise AssertionError(f"unexpected GET {url}")
+
+    posts = []
+
+    def _fake_post(url, json=None, timeout=None):
+        posts.append((url, json))
+        if url.endswith("/v1/runs"):
+            return _JsonResponse(201, {"run_id": "run-1", "session_id": "session-1", "status": "pending"})
+        if url.endswith("/v1/chat/turns"):
+            if chat_post_handler is not None:
+                return chat_post_handler(json)
+            return _JsonResponse(200, {
+                "session_id": "session-1", "run_id": "run-1", "intent": "explain_plan",
+                "assistant_message": "Galata Tower is a well-known landmark near your stay.",
+                "response_language": "en", "trip_patch": None, "requires_new_run": False,
+                "new_run_id": None, "new_run_status": None, "clarification_required": False, "warnings": [],
+            })
+        raise AssertionError(f"unexpected POST {url}")
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    at.button[0].click().run(timeout=15)  # submits the form; get_run already reports "completed"
+    assert not at.exception
+    return at, posts
+
+
+def test_chat_section_appears_below_a_completed_dashboard(monkeypatch):
+    at, _posts = _run_to_completed_dashboard(monkeypatch)
+    assert len(at.chat_input) == 1
+    headers = " ".join(h.value for h in at.subheader)
+    assert "Continue planning" in headers
+
+
+def test_chat_section_does_not_appear_while_run_is_pending(monkeypatch):
+    import streamlit
+
+    monkeypatch.setattr(streamlit, "rerun", lambda: None)
+    monkeypatch.setattr(httpx, "get", _health_ok(run_status="pending"))
+    monkeypatch.setattr(httpx, "post", lambda url, json=None, timeout=None: _JsonResponse(201, {"run_id": "run-1", "session_id": "session-1", "status": "pending"}))
+    monkeypatch.setattr(httpx, "stream", lambda method, url, headers=None, timeout=None: type("S", (), {
+        "status_code": 200, "iter_lines": lambda self: iter([]), "__enter__": lambda self: self, "__exit__": lambda self, *a: False,
+    })())
+
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    at.button[0].click().run(timeout=15)  # one pass: create the run, then one non-terminal render
+    assert not at.exception
+    assert len(at.chat_input) == 0
+
+
+def test_chat_section_does_not_appear_after_a_failed_run(monkeypatch):
+    def _fake_get(url, timeout=None):
+        if url.endswith("/health"):
+            return _JsonResponse(200, {"status": "ok", "service": "agent-system-a", "mode": "real"})
+        if _is_session_list_request(url):
+            return _JsonResponse(200, _EMPTY_SESSION_LIST_BODY)
+        return _JsonResponse(200, {
+            "run_id": "run-1", "session_id": "session-1", "status": "failed",
+            "created_at": "t", "updated_at": "t", "result": {"status": "failed", "reason": "internal_execution_error"},
+        })
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+    monkeypatch.setattr(httpx, "post", lambda url, json=None, timeout=None: _JsonResponse(201, {"run_id": "run-1", "session_id": "session-1", "status": "pending"}))
+
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    at.button[0].click().run(timeout=15)
+    assert not at.exception
+    assert len(at.chat_input) == 0
+
+
+def test_submitting_a_chat_message_posts_to_chat_turns_with_session_and_run_ids(monkeypatch):
+    at, posts = _run_to_completed_dashboard(monkeypatch)
+    at.chat_input[0].set_value("Why did you recommend Galata Tower?").run(timeout=15)
+    assert not at.exception
+
+    chat_posts = [(u, b) for u, b in posts if u.endswith("/v1/chat/turns")]
+    assert len(chat_posts) == 1
+    _, body = chat_posts[0]
+    assert body["session_id"] == "session-1"
+    assert body["run_id"] == "run-1"
+    assert body["user_message"] == "Why did you recommend Galata Tower?"
+
+    chat_texts = " ".join(m.markdown[0].value if m.markdown else "" for m in at.chat_message)
+    assert "Galata Tower" in chat_texts
+
+
+def test_explain_plan_chat_turn_never_changes_the_active_run_id(monkeypatch):
+    at, _posts = _run_to_completed_dashboard(monkeypatch)
+    at.chat_input[0].set_value("Why did you recommend Galata Tower?").run(timeout=15)
+    assert not at.exception
+    assert at.session_state["run_id"] == "run-1"
+
+
+def test_modify_trip_chat_turn_switches_to_the_new_run_id_but_keeps_the_session_id(monkeypatch):
+    def _chat_handler(_body):
+        return _JsonResponse(200, {
+            "session_id": "session-1", "run_id": "run-2", "intent": "modify_trip",
+            "assistant_message": "Updated your budget to 1000 USD and added shopping.",
+            "response_language": "en", "trip_patch": {"budget": {"amount_minor_units": 100000, "currency": "USD"}},
+            "requires_new_run": True, "new_run_id": "run-2", "new_run_status": "pending",
+            "clarification_required": False, "warnings": [],
+        })
+
+    at, _posts = _run_to_completed_dashboard(monkeypatch, chat_post_handler=_chat_handler)
+    at.chat_input[0].set_value("Change my budget to 1000 USD and add shopping").run(timeout=15)
+    assert not at.exception
+    assert at.session_state["run_id"] == "run-2"
+    assert at.session_state["session_id"] == "session-1"
+
+
+def test_chat_warnings_are_rendered_as_safe_captions_never_raw_json(monkeypatch):
+    def _chat_handler(_body):
+        return _JsonResponse(200, {
+            "session_id": "session-1", "run_id": "run-1", "intent": "modify_trip", "assistant_message": "Updated.",
+            "response_language": "en", "trip_patch": {"preferences": {"interests": ["shopping"]}},
+            "requires_new_run": True, "new_run_id": "run-2", "new_run_status": "pending",
+            "clarification_required": False, "warnings": ["unrecognized_interests_to_add:skydiving"],
+        })
+
+    at, _posts = _run_to_completed_dashboard(monkeypatch, chat_post_handler=_chat_handler)
+    at.chat_input[0].set_value("Add shopping and skydiving").run(timeout=15)
+    assert not at.exception
+    captions = " ".join(c.value for c in at.caption)
+    assert "unrecognized_interests_to_add:skydiving" in captions
+
+
+def test_plan_a_new_trip_clears_the_chat_transcript(monkeypatch):
+    at, _posts = _run_to_completed_dashboard(monkeypatch)
+    at.chat_input[0].set_value("Why did you recommend Galata Tower?").run(timeout=15)
+    assert not at.exception
+    assert len(at.session_state["chat_messages"]) > 0
+
+    new_trip_button = next(b for b in at.button if b.key == "new_trip_btn")
+    new_trip_button.click().run(timeout=15)
+    assert not at.exception
+    assert at.session_state["chat_messages"] == []
+    assert at.session_state["run_id"] is None
+
+
+def test_chat_preferred_language_seeded_from_trip_form_language_selection(monkeypatch):
+    result = {"status": "success", "observations": [], "warnings": []}
+
+    def _fake_get(url, timeout=None):
+        if url.endswith("/health"):
+            return _JsonResponse(200, {"status": "ok", "service": "agent-system-a", "mode": "real"})
+        if _is_session_list_request(url):
+            return _JsonResponse(200, _EMPTY_SESSION_LIST_BODY)
+        return _JsonResponse(200, {
+            "run_id": "run-1", "session_id": "session-1", "status": "completed",
+            "created_at": "t", "updated_at": "t", "result": result,
+        })
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+    monkeypatch.setattr(httpx, "post", lambda url, json=None, timeout=None: _JsonResponse(201, {"run_id": "run-1", "session_id": "session-1", "status": "pending"}))
+
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    language_select = next(sb for sb in at.selectbox if sb.label == "Preferred language")
+    language_select.set_value("ar").run(timeout=15)
+    at.button[0].click().run(timeout=15)
+    assert not at.exception
+
+
+# --- persistent-history/grounding correction: query-param session restoration -------------
+
+
+def _query_param(at, name: str):
+    """AppTest's own `query_params` exposes multi-value list semantics
+    (unlike real Streamlit's scalar `st.query_params[...]`) -- this
+    normalizes to the single value this app always sets."""
+    value = at.query_params.get(name)
+    return value[0] if isinstance(value, list) else value
+
+
+def test_query_params_are_set_after_creating_a_run(monkeypatch):
+    at, _posts = _run_to_completed_dashboard(monkeypatch)
+    assert _query_param(at, "run_id") == "run-1"
+    assert _query_param(at, "session_id") == "session-1"
+
+
+def _fake_get_with_chat_history(history_turns: list[dict]):
+    result = {"status": "success", "observations": [], "warnings": []}
+
+    def _fake_get(url, timeout=None):
+        if url.endswith("/health"):
+            return _JsonResponse(200, {"status": "ok", "service": "agent-system-a", "mode": "real"})
+        if _is_session_list_request(url):
+            return _JsonResponse(200, _EMPTY_SESSION_LIST_BODY)
+        if "/v1/chat/sessions/" in url:
+            return _JsonResponse(200, {"session_id": "session-1", "run_id": "run-1", "turns": history_turns})
+        if "/v1/runs/" in url:
+            return _JsonResponse(200, {
+                "run_id": "run-1", "session_id": "session-1", "status": "completed",
+                "created_at": "t", "updated_at": "t", "result": result,
+            })
+        raise AssertionError(f"unexpected GET {url}")
+    return _fake_get
+
+
+def test_session_and_transcript_restore_from_query_params_on_a_fresh_process(monkeypatch):
+    """Simulates a `chatbot-ui` restart: a genuinely NEW `AppTest`
+    instance (fresh in-memory session_state, exactly like a new server
+    process) whose URL still carries the previously-active session_id/
+    run_id query params -- the transcript must come back from System A's
+    own persistent store, not from anything client-side (which no longer
+    exists in this fresh process)."""
+    history = [
+        {"turn_id": "t1", "role": "user", "content": "Why did you recommend this?", "intent": None, "response_language": None, "status": "completed", "created_at": "t"},
+        {"turn_id": "t2", "role": "assistant", "content": "It matches your interests.", "intent": "explain_plan", "response_language": "en", "status": "completed", "created_at": "t"},
+    ]
+    monkeypatch.setattr(httpx, "get", _fake_get_with_chat_history(history))
+
+    at = AppTest.from_file(APP_PATH)
+    at.query_params["run_id"] = "run-1"
+    at.query_params["session_id"] = "session-1"
+    at.run(timeout=15)
+
+    assert not at.exception
+    assert at.session_state["run_id"] == "run-1"
+    assert at.session_state["session_id"] == "session-1"
+    assert at.session_state["chat_messages"] == [
+        {"role": "user", "content": "Why did you recommend this?"},
+        {"role": "assistant", "content": "It matches your interests."},
+    ]
+    chat_texts = " ".join(m.markdown[0].value if m.markdown else "" for m in at.chat_message)
+    assert "It matches your interests." in chat_texts
+
+
+def test_restored_transcript_does_not_duplicate_across_a_later_rerun(monkeypatch):
+    history = [
+        {"turn_id": "t1", "role": "user", "content": "hello", "intent": None, "response_language": None, "status": "completed", "created_at": "t"},
+        {"turn_id": "t2", "role": "assistant", "content": "hi there", "intent": "explain_plan", "response_language": "en", "status": "completed", "created_at": "t"},
+    ]
+    monkeypatch.setattr(httpx, "get", _fake_get_with_chat_history(history))
+
+    at = AppTest.from_file(APP_PATH)
+    at.query_params["run_id"] = "run-1"
+    at.query_params["session_id"] = "session-1"
+    at.run(timeout=15)
+    at.run(timeout=15)  # a second, unrelated rerun of the same live session
+
+    assert not at.exception
+    assert len(at.session_state["chat_messages"]) == 2  # never re-appended/duplicated
+
+
+def test_mismatched_session_id_query_param_is_never_trusted(monkeypatch):
+    """A URL claiming a session_id that does not match the real run's own
+    stored session_id must never be restored -- proves the server-side
+    cross-check, not just presence of both params, gates restoration."""
+    def _fake_get(url, timeout=None):
+        if url.endswith("/health"):
+            return _JsonResponse(200, {"status": "ok", "service": "agent-system-a", "mode": "real"})
+        if _is_session_list_request(url):
+            return _JsonResponse(200, _EMPTY_SESSION_LIST_BODY)
+        return _JsonResponse(200, {
+            "run_id": "run-1", "session_id": "the-real-session-id", "status": "completed",
+            "created_at": "t", "updated_at": "t", "result": {"status": "success", "observations": [], "warnings": []},
+        })
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+    at = AppTest.from_file(APP_PATH)
+    at.query_params["run_id"] = "run-1"
+    at.query_params["session_id"] = "a-different-forged-session-id"
+    at.run(timeout=15)
+
+    assert not at.exception
+    assert at.session_state["run_id"] is None  # falls through to the ordinary empty form
+
+
+def test_plan_a_new_trip_clears_query_params(monkeypatch):
+    at, _posts = _run_to_completed_dashboard(monkeypatch)
+    assert _query_param(at, "run_id") == "run-1"
+    new_trip_button = next(b for b in at.button if b.key == "new_trip_btn")
+    new_trip_button.click().run(timeout=15)
+    assert not at.exception
+    assert "run_id" not in dict(at.query_params)
+    assert "session_id" not in dict(at.query_params)
+
+
+# --- persistent-history/grounding correction: truthful provider-unavailable error ---------
+
+
+def test_provider_unavailable_chat_error_shows_a_truthful_specific_message(monkeypatch):
+    def _chat_handler(_body):
+        return _JsonResponse(503, {
+            "schema_version": "1.0.0", "error_code": "PROVIDER_UNAVAILABLE",
+            "message": "The chat assistant is temporarily unavailable.", "trace_id": "x", "retriable": True,
+        })
+
+    at, _posts = _run_to_completed_dashboard(monkeypatch, chat_post_handler=_chat_handler)
+    at.chat_input[0].set_value("Why did you recommend Galata Tower?").run(timeout=15)
+    assert not at.exception
+    chat_texts = " ".join(m.markdown[0].value if m.markdown else "" for m in at.chat_message)
+    assert "temporarily unavailable" in chat_texts
+
+
+# --- Hybrid Chat C.2: recent-session sidebar ----------------------------------------------
+
+
+_RUN_A = {
+    "run_id": "run-a", "session_id": "session-a", "status": "completed",
+    "result": {"status": "success", "observations": [], "warnings": []},
+    "trip_request": {
+        "origin": "BEY", "destination": "IST", "depart_date": "2026-09-19", "return_date": "2026-09-23",
+        "traveler_count": 2, "budget": {"amount_minor_units": 500000, "currency": "TRY"},
+        "preferences": {"interests": ["history"], "pace": "moderate", "language": "en", "mobility_constraints": []},
+    },
+}
+_RUN_B = {
+    "run_id": "run-b", "session_id": "session-b", "status": "completed",
+    "result": {"status": "success", "observations": [], "warnings": []},
+    "trip_request": {
+        "origin": "LHR", "destination": "IST", "depart_date": "2026-10-01", "return_date": "2026-10-05",
+        "traveler_count": 1, "budget": {"amount_minor_units": 300000, "currency": "TRY"},
+        "preferences": {"interests": ["food"], "pace": "relaxed", "language": "en", "mobility_constraints": []},
+    },
+}
+_SESSION_A_SUMMARY = {
+    "session_id": "session-a", "latest_run_id": "run-a", "latest_run_status": "completed",
+    "title": "BEY → Istanbul · 19–23 Sep", "origin": "BEY", "destination": "IST",
+    "depart_date": "2026-09-19", "return_date": "2026-09-23", "preferred_language": "en",
+    "chat_turn_count": 2, "created_at": "t1", "updated_at": "t3",
+}
+_SESSION_B_SUMMARY = {
+    "session_id": "session-b", "latest_run_id": "run-b", "latest_run_status": "completed",
+    "title": "LHR → Istanbul · 1–5 Oct", "origin": "LHR", "destination": "IST",
+    "depart_date": "2026-10-01", "return_date": "2026-10-05", "preferred_language": "en",
+    "chat_turn_count": 0, "created_at": "t2", "updated_at": "t2",
+}
+_HISTORY_A = [
+    {"turn_id": "a1", "role": "user", "content": "Why did you pick these dates?", "intent": None, "response_language": None, "status": "completed", "created_at": "t"},
+    {"turn_id": "a2", "role": "assistant", "content": "They matched your requested travel window.", "intent": "explain_plan", "response_language": "en", "status": "completed", "created_at": "t"},
+]
+_HISTORY_B: list = []
+
+
+def _make_sidebar_backend(sessions, run_lookup, history_lookup):
+    def _fake_get(url, timeout=None):
+        if url.endswith("/health"):
+            return _JsonResponse(200, {"status": "ok", "service": "agent-system-a", "mode": "real"})
+        if _is_session_list_request(url):
+            summaries = sessions() if callable(sessions) else sessions
+            return _JsonResponse(200, {"sessions": summaries, "total": len(summaries), "limit": 20, "offset": 0})
+        if "/v1/chat/sessions/" in url and "/turns" in url:
+            session_id = url.split("/v1/chat/sessions/")[1].split("/turns")[0]
+            turns = history_lookup.get(session_id, [])
+            return _JsonResponse(200, {"session_id": session_id, "run_id": "?", "turns": turns})
+        if "/v1/runs/" in url:
+            run_id = url.rstrip("/").split("/v1/runs/")[-1]
+            record = run_lookup[run_id]
+            return _JsonResponse(200, {
+                "run_id": record["run_id"], "session_id": record["session_id"], "status": record["status"],
+                "created_at": "t", "updated_at": "t", "result": record["result"], "trip_request": record["trip_request"],
+            })
+        raise AssertionError(f"unexpected GET {url}")
+    return _fake_get
+
+
+def test_sidebar_renders_recent_sessions(monkeypatch):
+    monkeypatch.setattr(httpx, "get", _make_sidebar_backend(
+        [_SESSION_A_SUMMARY, _SESSION_B_SUMMARY], {"run-a": _RUN_A, "run-b": _RUN_B}, {"session-a": _HISTORY_A, "session-b": _HISTORY_B},
+    ))
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    assert not at.exception
+    sidebar_text = " ".join(x.value for x in list(at.sidebar.subheader) + list(at.sidebar.caption))
+    assert "Recent trips" in sidebar_text
+    button_labels = [b.label for b in at.sidebar.button]
+    assert any("BEY" in label for label in button_labels)
+    assert any("LHR" in label for label in button_labels)
+
+
+def test_sidebar_active_session_is_highlighted(monkeypatch):
+    monkeypatch.setattr(httpx, "get", _make_sidebar_backend(
+        [_SESSION_A_SUMMARY, _SESSION_B_SUMMARY], {"run-a": _RUN_A, "run-b": _RUN_B}, {"session-a": _HISTORY_A, "session-b": _HISTORY_B},
+    ))
+    at = AppTest.from_file(APP_PATH)
+    at.query_params["session_id"] = "session-a"
+    at.query_params["run_id"] = "run-a"
+    at.run(timeout=15)
+    assert not at.exception
+    active_button = next(b for b in at.sidebar.button if "BEY" in b.label)
+    other_button = next(b for b in at.sidebar.button if "LHR" in b.label)
+    assert active_button.disabled is True
+    assert other_button.disabled is False
+
+
+def test_selecting_a_session_restores_its_run_and_transcript(monkeypatch):
+    monkeypatch.setattr(httpx, "get", _make_sidebar_backend(
+        [_SESSION_A_SUMMARY, _SESSION_B_SUMMARY], {"run-a": _RUN_A, "run-b": _RUN_B}, {"session-a": _HISTORY_A, "session-b": _HISTORY_B},
+    ))
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    session_a_button = next(b for b in at.sidebar.button if "BEY" in b.label)
+    session_a_button.click().run(timeout=15)
+
+    assert not at.exception
+    assert at.session_state["session_id"] == "session-a"
+    assert at.session_state["run_id"] == "run-a"
+    assert at.session_state["chat_messages"] == [
+        {"role": "user", "content": "Why did you pick these dates?"},
+        {"role": "assistant", "content": "They matched your requested travel window."},
+    ]
+    assert at.session_state["trip_request_submitted"]["origin"] == "BEY"
+    # No new run was created -- the existing run is loaded, not re-planned.
+    button_labels = [b.label for b in at.button]
+    assert "Plan my trip" not in button_labels
+
+
+def test_switching_a_to_b_to_a_never_merges_messages(monkeypatch):
+    monkeypatch.setattr(httpx, "get", _make_sidebar_backend(
+        [_SESSION_A_SUMMARY, _SESSION_B_SUMMARY], {"run-a": _RUN_A, "run-b": _RUN_B}, {"session-a": _HISTORY_A, "session-b": _HISTORY_B},
+    ))
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    next(b for b in at.sidebar.button if "BEY" in b.label).click().run(timeout=15)
+    assert at.session_state["chat_messages"] == [
+        {"role": "user", "content": "Why did you pick these dates?"},
+        {"role": "assistant", "content": "They matched your requested travel window."},
+    ]
+
+    next(b for b in at.sidebar.button if "LHR" in b.label).click().run(timeout=15)
+    assert at.session_state["session_id"] == "session-b"
+    assert at.session_state["chat_messages"] == []  # session B's own (empty) transcript, never A's leftover messages
+
+    next(b for b in at.sidebar.button if "BEY" in b.label).click().run(timeout=15)
+    assert at.session_state["session_id"] == "session-a"
+    assert at.session_state["chat_messages"] == [
+        {"role": "user", "content": "Why did you pick these dates?"},
+        {"role": "assistant", "content": "They matched your requested travel window."},
+    ]
+
+
+def test_new_trip_preserves_sidebar_history(monkeypatch):
+    monkeypatch.setattr(httpx, "get", _make_sidebar_backend(
+        [_SESSION_A_SUMMARY, _SESSION_B_SUMMARY], {"run-a": _RUN_A, "run-b": _RUN_B}, {"session-a": _HISTORY_A, "session-b": _HISTORY_B},
+    ))
+    at = AppTest.from_file(APP_PATH)
+    at.query_params["session_id"] = "session-a"
+    at.query_params["run_id"] = "run-a"
+    at.run(timeout=15)
+    new_trip_button = next(b for b in at.button if b.key == "new_trip_btn")
+    new_trip_button.click().run(timeout=15)
+
+    assert not at.exception
+    assert at.session_state["run_id"] is None  # the active trip was cleared
+    button_labels = [b.label for b in at.sidebar.button]
+    assert any("BEY" in label for label in button_labels)  # but the sidebar still lists it
+    assert any("LHR" in label for label in button_labels)
+
+
+def test_sidebar_api_failure_degrades_safely_and_preserves_active_trip(monkeypatch):
+    def _fake_get(url, timeout=None):
+        if url.endswith("/health"):
+            return _JsonResponse(200, {"status": "ok", "service": "agent-system-a", "mode": "real"})
+        if _is_session_list_request(url):
+            raise httpx.ConnectError("connection refused")
+        return _JsonResponse(200, {
+            "run_id": "run-1", "session_id": "session-1", "status": "completed",
+            "created_at": "t", "updated_at": "t", "result": {"status": "success", "observations": [], "warnings": []},
+        })
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+    monkeypatch.setattr(httpx, "post", lambda url, json=None, timeout=None: _JsonResponse(201, {"run_id": "run-1", "session_id": "session-1", "status": "pending"}))
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    at.button[0].click().run(timeout=15)
+
+    assert not at.exception
+    assert at.session_state["run_id"] == "run-1"  # the active trip is completely unaffected
+    sidebar_warnings = " ".join(w.value for w in at.sidebar.warning)
+    assert "recent trips" in sidebar_warnings.lower() or "could not load" in sidebar_warnings.lower()
+
+
+def test_arabic_session_title_renders_without_error(monkeypatch):
+    arabic_history = [
+        {"turn_id": "b1", "role": "user", "content": "ما هي ميزانيتي؟", "intent": None, "response_language": None, "status": "completed", "created_at": "t"},
+        {"turn_id": "b2", "role": "assistant", "content": "ميزانيتك الحالية هي 5,000.00 TRY.", "intent": "explain_plan", "response_language": "ar", "status": "completed", "created_at": "t"},
+    ]
+    arabic_summary = dict(_SESSION_A_SUMMARY, title="BEY → Istanbul · 19–23 Sep", preferred_language="ar")
+    monkeypatch.setattr(httpx, "get", _make_sidebar_backend(
+        [arabic_summary], {"run-a": _RUN_A}, {"session-a": arabic_history},
+    ))
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    assert not at.exception
+    session_button = next(b for b in at.sidebar.button if "BEY" in b.label)
+    session_button.click().run(timeout=15)
+    assert not at.exception
+    assert at.session_state["chat_messages"][0]["content"] == "ما هي ميزانيتي؟"
+    assert "5,000.00 TRY" in at.session_state["chat_messages"][1]["content"]
