@@ -139,6 +139,138 @@ def test_failed_observation_never_surfaces_as_a_successful_payload():
     assert results.extract_weather(failed_result) is None
 
 
+# --- extract_weather_status: explains WHY weather is unavailable (Q.1) ---------------
+
+
+def test_build_budget_chart_data_prefers_server_side_budget_summary():
+    """Manual QA remediation Q.1 (§B): when the API result carries a real
+    budget_summary (already currency-coherent), the chart is built from
+    THAT, never re-derived by naively mixing raw per-observation prices
+    of possibly different currencies."""
+    result = {
+        "status": "success", "observations": [], "warnings": [],
+        "budget_summary": {
+            "budget": {"amount_minor_units": 500000, "currency": "USD"},
+            "fx_quote": {"base_currency": "USD", "quote_currency": "TRY", "rate": "40.00", "effective_date": "2026-08-19", "provider": "frankfurter.app (ECB reference rates)", "retrieved_at": "x", "cache_status": "hit"},
+            "fx_status": "success",
+            "cheapest_flight": {"raw": {"amount_minor_units": 4409200, "currency": "TRY"}, "normalized": {"amount_minor_units": 110230, "currency": "USD"}},
+            "cheapest_stay_total": None,
+        },
+    }
+    chart = results.build_budget_chart_data(result, {"budget": {"amount_minor_units": 500000, "currency": "USD"}})
+    assert chart["currency"] == "USD"
+    assert chart["labels"] == ["Your budget", "Cheapest flight"]
+    assert chart["values"] == [5000.0, 1102.30]
+
+
+def test_build_budget_chart_data_never_mixes_currencies_without_a_budget_summary():
+    """Fallback path (no budget_summary present): a TRY stay price must
+    never be charted under a USD budget label."""
+    result = {"status": "success", "observations": [
+        {"action": "search_stays", "status": "success", "envelope": {"stays": [
+            {"stay": {"nightly_price": {"amount_minor_units": 35593, "currency": "TRY"}}},
+        ]}},
+    ], "warnings": []}
+    trip_request = {"depart_date": "2026-09-10", "return_date": "2026-09-13", "budget": {"amount_minor_units": 500000, "currency": "USD"}}
+    chart = results.build_budget_chart_data(result, trip_request)
+    # Only "Your budget" -- the TRY stay price is correctly excluded, never
+    # plotted as if it were USD.
+    assert chart is None or "Cheapest stay total" not in chart["labels"]
+
+
+# --- normalize_money / format_money_pair (Manual QA remediation Q.1, second correction pass §1) ---
+
+
+_USD_RESULT = {"budget_summary": {"budget": {"amount_minor_units": 500000, "currency": "USD"}, "fx_quote": {
+    "base_currency": "USD", "quote_currency": "TRY", "rate": "40.00", "effective_date": "2026-08-19",
+    "provider": "frankfurter.app (ECB reference rates)", "retrieved_at": "x", "cache_status": "hit",
+}}}
+_TRY_RESULT = {"budget_summary": {"budget": {"amount_minor_units": 500000, "currency": "TRY"}, "fx_quote": None}}
+_NO_QUOTE_RESULT = {"budget_summary": {"budget": {"amount_minor_units": 500000, "currency": "USD"}, "fx_quote": None, "fx_status": "unavailable"}}
+
+
+def test_normalize_money_leaves_matching_currency_unchanged():
+    assert results.normalize_money({"amount_minor_units": 100, "currency": "TRY"}, "TRY", None) == {"amount_minor_units": 100, "currency": "TRY"}
+
+
+def test_normalize_money_converts_try_to_usd_decimal_exact():
+    quote = {"base_currency": "USD", "quote_currency": "TRY", "rate": "40.00"}
+    result = results.normalize_money({"amount_minor_units": 400000, "currency": "TRY"}, "USD", quote)
+    assert result == {"amount_minor_units": 10000, "currency": "USD"}  # 4000.00 TRY / 40.00 = 100.00 USD
+
+
+def test_normalize_money_converts_usd_to_try():
+    quote = {"base_currency": "USD", "quote_currency": "TRY", "rate": "40.00"}
+    result = results.normalize_money({"amount_minor_units": 10000, "currency": "USD"}, "TRY", quote)
+    assert result == {"amount_minor_units": 400000, "currency": "TRY"}
+
+
+def test_normalize_money_returns_none_without_a_quote():
+    assert results.normalize_money({"amount_minor_units": 100, "currency": "TRY"}, "USD", None) is None
+
+
+def test_normalize_money_returns_none_for_an_unrelated_pair():
+    quote = {"base_currency": "USD", "quote_currency": "TRY", "rate": "40.00"}
+    assert results.normalize_money({"amount_minor_units": 100, "currency": "EUR"}, "USD", quote) is None
+
+
+def test_format_money_pair_try_amount_in_try_trip_is_unchanged_and_unflagged():
+    pair = results.format_money_pair({"amount_minor_units": 100000, "currency": "TRY"}, _TRY_RESULT)
+    assert "TRY" in pair["primary"]
+    assert pair["secondary"] is None
+    assert pair["conversion_unavailable"] is False
+
+
+def test_format_money_pair_try_amount_in_usd_trip_is_converted_with_raw_secondary():
+    pair = results.format_money_pair({"amount_minor_units": 400000, "currency": "TRY"}, _USD_RESULT)
+    assert "USD" in pair["primary"]
+    assert "TRY" not in pair["primary"]  # never mislabeled
+    assert pair["secondary"] is not None and "TRY" in pair["secondary"]
+    assert pair["conversion_unavailable"] is False
+
+
+def test_format_money_pair_usd_amount_in_usd_trip_needs_no_conversion():
+    pair = results.format_money_pair({"amount_minor_units": 10000, "currency": "USD"}, _USD_RESULT)
+    assert "USD" in pair["primary"]
+    assert pair["secondary"] is None
+
+
+def test_format_money_pair_conversion_unavailable_shows_raw_currency_never_mislabeled():
+    """Required behavior: if FX fails, show native TRY explicitly and
+    flag conversion as unavailable -- never label it USD."""
+    pair = results.format_money_pair({"amount_minor_units": 400000, "currency": "TRY"}, _NO_QUOTE_RESULT)
+    assert "TRY" in pair["primary"]
+    assert "USD" not in pair["primary"]
+    assert pair["conversion_unavailable"] is True
+
+
+def test_extract_weather_status_returns_none_when_no_weather_observation_exists():
+    assert results.extract_weather_status(None) is None
+    assert results.extract_weather_status({"status": "success", "observations": [], "warnings": []}) is None
+
+
+def test_extract_weather_status_returns_forecast_not_yet_available_with_the_precise_date():
+    envelope = {
+        "status": "forecast_not_yet_available",
+        "result": {"location": "Istanbul", "kind": "unavailable", "earliest_available_forecast_date": "2026-09-04"},
+    }
+    result = {"status": "partial", "observations": [
+        {"action": "get_weather", "status": "forecast_not_yet_available", "fingerprint": "fp1", "envelope": envelope, "warnings": []},
+    ], "warnings": []}
+    status_info = results.extract_weather_status(result)
+    assert status_info["status"] == "forecast_not_yet_available"
+    assert status_info["result"]["earliest_available_forecast_date"] == "2026-09-04"
+
+
+def test_extract_weather_status_returns_the_status_even_for_a_generic_failure():
+    result = {"status": "partial", "observations": [
+        {"action": "get_weather", "status": "unavailable", "fingerprint": "fp1", "envelope": None, "warnings": ["status=unavailable"]},
+    ], "warnings": []}
+    status_info = results.extract_weather_status(result)
+    assert status_info["status"] == "unavailable"
+    assert status_info["result"] is None
+
+
 # --- warnings / citations / provenance -----------------------------------------------------
 
 

@@ -14,6 +14,7 @@ what a result *is*, only reads it.
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Optional
 
 # search_stays/estimate_fair_price/call_istanbul_expert observations are
@@ -72,6 +73,23 @@ def extract_weather(result: Optional[dict[str, Any]]) -> Optional[dict[str, Any]
         if payload:
             return payload
     return None
+
+
+def extract_weather_status(result: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Manual QA remediation Q.1: unlike `extract_weather` (successful
+    results only), this returns the most recent get_weather observation's
+    raw status and envelope result even when NOT successful -- lets the UI
+    explain precisely why weather is unavailable (e.g.
+    'forecast_not_yet_available' with the exact date it opens up) instead
+    of staying silent or showing a bare, unexplained status code."""
+    grouped = observations_by_action(result)
+    weather_obs = grouped.get("get_weather") or []
+    if not weather_obs:
+        return None
+    latest = weather_obs[-1]
+    envelope = latest.get("envelope")
+    envelope_result = envelope.get("result") if isinstance(envelope, dict) else None
+    return {"status": latest.get("status"), "result": envelope_result}
 
 
 def extract_web_evidence(result: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -174,6 +192,74 @@ def collect_provenance_badges(result: Optional[dict[str, Any]]) -> list[dict[str
     return badges
 
 
+def get_target_currency(result: Optional[dict[str, Any]]) -> Optional[str]:
+    """The trip's own budget currency, if a real budget_summary exists
+    for this run (orchestration/system_a/budget_summary.py) -- Manual QA
+    remediation Q.1 (second correction pass, §1)."""
+    budget_summary = result.get("budget_summary") if isinstance(result, dict) else None
+    if not isinstance(budget_summary, dict):
+        return None
+    budget = budget_summary.get("budget")
+    currency = budget.get("currency") if isinstance(budget, dict) else None
+    return str(currency).upper() if currency else None
+
+
+def get_fx_quote(result: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """The ONE real, already-fetched run-level FX quote for this run, or
+    None if no conversion was ever needed/possible -- every UI location
+    that normalizes an amount reuses THIS quote, never issuing a second
+    FX call of its own (Manual QA remediation Q.1, second correction
+    pass, §1)."""
+    budget_summary = result.get("budget_summary") if isinstance(result, dict) else None
+    if not isinstance(budget_summary, dict):
+        return None
+    quote = budget_summary.get("fx_quote")
+    return quote if isinstance(quote, dict) else None
+
+
+def normalize_money(
+    money: Optional[dict[str, Any]], target_currency: Optional[str], fx_quote: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Converts a real, raw Money-shaped dict into `target_currency`
+    using the already-fetched `fx_quote` -- pure arithmetic on data the
+    API already returned, never a network call of its own. Returns the
+    input unchanged (as a new dict; `money` itself is never mutated) when
+    its currency already matches `target_currency`. Returns None -- never
+    a fabricated amount -- when conversion isn't possible: no quote, or a
+    currency pair the quote doesn't actually cover. `Decimal`/
+    `ROUND_HALF_UP` throughout, mirroring providers/money.py's own
+    conversion rule exactly (this module cannot import from `providers/`
+    -- the frontend never calls a provider directly -- so the same small,
+    pure arithmetic is reproduced here rather than reused)."""
+    if not isinstance(money, dict):
+        return None
+    amount = money.get("amount_minor_units")
+    currency = money.get("currency")
+    if amount is None or not currency or not target_currency:
+        return None
+    currency = str(currency).upper()
+    target = str(target_currency).upper()
+    if currency == target:
+        return {"amount_minor_units": amount, "currency": target}
+    if not isinstance(fx_quote, dict):
+        return None
+    try:
+        rate = Decimal(str(fx_quote["rate"]))
+    except (KeyError, InvalidOperation, TypeError):
+        return None
+    base = str(fx_quote.get("base_currency", "")).upper()
+    quote_currency = str(fx_quote.get("quote_currency", "")).upper()
+    decimal_amount = Decimal(amount) / Decimal(100)
+    if currency == base and target == quote_currency:
+        converted = decimal_amount * rate
+    elif currency == quote_currency and target == base:
+        converted = decimal_amount / rate
+    else:
+        return None  # this quote does not cover this currency pair -- never triangulated
+    converted = converted.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return {"amount_minor_units": int((converted * 100).to_integral_value(rounding=ROUND_HALF_UP)), "currency": target}
+
+
 def format_money(money: Optional[dict[str, Any]]) -> str:
     if not isinstance(money, dict):
         return "—"
@@ -185,6 +271,49 @@ def format_money(money: Optional[dict[str, Any]]) -> str:
         return f"{amount / 100:,.2f} {currency}"
     except (TypeError, ValueError):
         return "—"
+
+
+def format_money_pair(money: Optional[dict[str, Any]], result: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """The one shared presentation rule for EVERY rendered price in the
+    app (Manual QA remediation Q.1, second correction pass, §1: flight
+    cards, stay nightly price, fair-price estimates, stay totals, map
+    popups) -- never a per-location reimplementation that could drift.
+
+    Returns {"primary": str, "secondary": Optional[str], "conversion_unavailable": bool}:
+    - `primary` is the amount in the trip's own budget currency whenever
+      that's determinable (unchanged if already in that currency, or
+      genuinely converted using the run's one FX quote) -- this is what
+      every USD trip should show as the headline number everywhere.
+    - `secondary`, when present, discloses the real raw provider-native
+      amount (e.g. the true TRY accommodation price) as detail -- the
+      original evidence is never hidden, only demoted to secondary.
+    - `conversion_unavailable` is True only when the raw currency
+      genuinely differs from the trip's currency and no FX quote could
+      convert it -- the caller must show this as an explicit warning and
+      MUST NOT label the raw (unconverted) amount with the trip's
+      currency."""
+    if not isinstance(money, dict) or not money.get("currency"):
+        return {"primary": format_money(money), "secondary": None, "conversion_unavailable": False}
+    target = get_target_currency(result)
+    raw_currency = str(money["currency"]).upper()
+    if not target or raw_currency == target:
+        return {"primary": format_money(money), "secondary": None, "conversion_unavailable": False}
+    normalized = normalize_money(money, target, get_fx_quote(result))
+    if normalized is not None:
+        return {"primary": format_money(normalized), "secondary": f"Raw: {format_money(money)}", "conversion_unavailable": False}
+    return {"primary": format_money(money), "secondary": None, "conversion_unavailable": True}
+
+
+def nights_from_trip_request(trip_request: Optional[dict[str, Any]]) -> Optional[int]:
+    if not isinstance(trip_request, dict) or not trip_request.get("depart_date") or not trip_request.get("return_date"):
+        return None
+    try:
+        from datetime import date as _date
+        depart = _date.fromisoformat(str(trip_request["depart_date"]))
+        ret = _date.fromisoformat(str(trip_request["return_date"]))
+    except ValueError:
+        return None
+    return max((ret - depart).days, 0)
 
 
 def extract_map_points(result: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -204,6 +333,12 @@ def extract_map_points(result: Optional[dict[str, Any]]) -> list[dict[str, Any]]
         except (TypeError, ValueError):
             continue
         points.append({
+            # Manual QA remediation Q.1 (second correction pass, §1): the
+            # raw Money dict, alongside the pre-formatted string below --
+            # additive, so any existing reader of `nightly_price` as a
+            # string is unaffected; a currency-aware caller uses
+            # `nightly_price_raw` with format_money_pair() instead.
+            "nightly_price_raw": stay.get("nightly_price"),
             "label": stay.get("name") or stay.get("stay_id") or "Stay candidate",
             "lat": lat, "lon": lon,
             "nightly_price": format_money(stay.get("nightly_price")),
@@ -220,6 +355,23 @@ def build_budget_chart_data(
     the cheapest returned nightly stay price x number of nights. Returns
     None when there is not enough real numeric data to chart anything
     honest -- never a chart with a fabricated bar."""
+    # Manual QA remediation Q.1 (§B): prefers the server-computed
+    # `budget_summary` (orchestration/system_a/budget_summary.py), which
+    # already converts every amount into ONE coherent currency (the
+    # trip's own budget currency) using one real, provenance-carrying FX
+    # quote -- never mixes a raw TRY accommodation price into a chart
+    # labeled with the trip's USD budget currency, which the OLD version
+    # of this function did (it took whichever currency the budget field
+    # happened to be in and plotted every OTHER price under that same
+    # label, regardless of what currency that price actually was).
+    budget_summary = result.get("budget_summary") if isinstance(result, dict) else None
+    if isinstance(budget_summary, dict):
+        return _chart_data_from_budget_summary(budget_summary)
+
+    # Fallback for a result with no budget_summary at all (e.g. a run
+    # persisted before this remediation) -- only ever charts amounts
+    # already confirmed to share the SAME currency as the budget, never
+    # a cross-currency mix.
     labels: list[str] = []
     values: list[float] = []
     currency = None
@@ -232,7 +384,11 @@ def build_budget_chart_data(
             values.append(budget["amount_minor_units"] / 100)
 
     flights = extract_flight_options(result)
-    flight_prices = [f["price"]["amount_minor_units"] for f in flights if isinstance(f.get("price"), dict) and f["price"].get("amount_minor_units") is not None]
+    flight_prices = [
+        f["price"]["amount_minor_units"] for f in flights
+        if isinstance(f.get("price"), dict) and f["price"].get("amount_minor_units") is not None
+        and f["price"].get("currency") == currency
+    ]
     if flight_prices:
         labels.append("Cheapest flight")
         values.append(min(flight_prices) / 100)
@@ -252,11 +408,35 @@ def build_budget_chart_data(
         for s in stays
         if isinstance(s.get("stay"), dict) and isinstance(s["stay"].get("nightly_price"), dict)
         and s["stay"]["nightly_price"].get("amount_minor_units") is not None
+        and s["stay"]["nightly_price"].get("currency") == currency
     ]
     if nightly_prices and nights:
         labels.append("Cheapest stay total")
         values.append(min(nightly_prices) * nights / 100)
 
     if len(values) < 2:  # need at least a budget + one real cost to be a meaningful comparison
+        return None
+    return {"labels": labels, "values": values, "currency": currency or ""}
+
+
+def _chart_data_from_budget_summary(budget_summary: dict[str, Any]) -> Optional[dict[str, list]]:
+    budget = budget_summary.get("budget") or {}
+    currency = budget.get("currency")
+    labels: list[str] = []
+    values: list[float] = []
+    if budget.get("amount_minor_units") is not None and currency:
+        labels.append("Your budget")
+        values.append(budget["amount_minor_units"] / 100)
+
+    for key, label in (("cheapest_flight", "Cheapest flight"), ("cheapest_stay_total", "Cheapest stay total")):
+        entry = budget_summary.get(key)
+        if not isinstance(entry, dict):
+            continue
+        normalized = entry.get("normalized")
+        if isinstance(normalized, dict) and normalized.get("amount_minor_units") is not None:
+            labels.append(label)
+            values.append(normalized["amount_minor_units"] / 100)
+
+    if len(values) < 2:
         return None
     return {"labels": labels, "values": values, "currency": currency or ""}

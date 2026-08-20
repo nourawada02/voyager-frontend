@@ -224,6 +224,123 @@ def test_return_date_before_depart_date_is_rejected_without_a_network_call(monke
     assert not posts  # no create_run call was ever made
 
 
+def test_past_depart_date_is_rejected_without_a_network_call(monkeypatch):
+    """Manual QA remediation Q.1: a past departure date must never reach
+    create_run -- caught client-side with a clear inline message."""
+    from datetime import date, timedelta
+
+    monkeypatch.setattr(httpx, "get", _health_ok())
+    posts = []
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: posts.append(1))
+
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    yesterday = date.today() - timedelta(days=1)
+    at.date_input[0].set_value(yesterday)
+    at.button[0].click().run(timeout=15)
+
+    assert not at.exception
+    assert not posts
+    assert any("past" in e.value.lower() for e in at.error)
+
+
+def test_today_and_tomorrow_depart_dates_are_accepted_client_side(monkeypatch):
+    """Manual QA remediation Q.1: today and tomorrow must clear client-side
+    validation (the run still needs a real backend to actually complete,
+    but no local "in the past" rejection should fire for either)."""
+    from datetime import date, timedelta
+
+    monkeypatch.setattr(httpx, "get", _health_ok())
+    posts = []
+
+    def _fake_post(url, json=None, timeout=None):
+        posts.append(json)
+        return _JsonResponse(201, {"run_id": "run-1", "session_id": "session-1", "status": "pending"})
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    for offset_days in (0, 1):
+        at = AppTest.from_file(APP_PATH)
+        at.run(timeout=15)
+        at.date_input[0].set_value(date.today() + timedelta(days=offset_days))
+        at.button[0].click().run(timeout=15)
+        assert not at.exception
+        assert not any("past" in e.value.lower() for e in at.error)
+
+    assert len(posts) == 2
+    assert posts[0]["trip_request"]["depart_date"] == date.today().isoformat()
+    assert posts[1]["trip_request"]["depart_date"] == (date.today() + timedelta(days=1)).isoformat()
+
+
+def test_changing_depart_date_pulls_an_earlier_return_date_forward_live(monkeypatch):
+    """Manual QA remediation Q.1: "changing departure revalidates return"
+    -- moving departure past an already-selected return date must move
+    the return date forward too, live (no submit needed), via the
+    on_change callback, never leaving return before depart in session
+    state."""
+    from datetime import date, timedelta
+
+    monkeypatch.setattr(httpx, "get", _health_ok())
+
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    early_depart = date.today() + timedelta(days=10)
+    at.date_input[0].set_value(early_depart).run(timeout=15)
+    at.date_input[1].set_value(early_depart + timedelta(days=2)).run(timeout=15)
+    assert at.date_input[1].value == early_depart + timedelta(days=2)
+
+    later_depart = date.today() + timedelta(days=20)
+    at.date_input[0].set_value(later_depart).run(timeout=15)
+
+    assert not at.exception
+    assert at.date_input[1].value >= later_depart
+
+
+def test_currency_offers_try_and_usd_only_genuine_fx_conversion_exists(monkeypatch):
+    """Manual QA remediation Q.1 (user correction pass §B): a genuine FX-
+    conversion capability now exists (providers/fx_frankfurter.py,
+    orchestration/system_a/budget_summary.py) -- TRY and USD are both
+    offered. EUR remains excluded: no EUR rate source was verified."""
+    monkeypatch.setattr(httpx, "get", _health_ok())
+
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    currency_select = next(sb for sb in at.selectbox if sb.label == "Currency")
+    assert currency_select.options == ["TRY", "USD"]
+    assert currency_select.value == "TRY"
+    assert "EUR" not in currency_select.options
+
+
+def test_budget_label_is_stable_never_hardcoded_to_a_specific_currency(monkeypatch):
+    """Pre-commit stabilization, required test 8: the budget amount
+    widget's label must be the stable "Budget amount" -- never a
+    currency-specific label like "Budget (TRY)"/"Budget (USD)". Inside
+    st.form, a currency-embedded label only reflected the PREVIOUS
+    selection until submit (form widgets don't rerun on individual
+    change), which misled the user into thinking their currency choice
+    hadn't registered."""
+    monkeypatch.setattr(httpx, "get", _health_ok())
+
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    number_inputs = list(at.number_input)
+    budget_widgets = [w for w in number_inputs if "Budget" in w.label]
+    assert len(budget_widgets) == 1
+    assert budget_widgets[0].label == "Budget amount"
+    assert "TRY" not in budget_widgets[0].label
+    assert "USD" not in budget_widgets[0].label
+
+    # Switching currency must not change the label at all (it is stable
+    # now) and must not raise -- proves the widget no longer depends on
+    # the live `currency` value for its own label text.
+    currency_select = next(sb for sb in at.selectbox if sb.label == "Currency")
+    at = currency_select.set_value("USD").run(timeout=15)
+    assert not at.exception
+    budget_widgets_after = [w for w in at.number_input if "Budget" in w.label]
+    assert len(budget_widgets_after) == 1
+    assert budget_widgets_after[0].label == "Budget amount"
+
+
 # --- named evidence: session-state survival, reconnect/replay, cancel, terminal states -----
 
 
@@ -357,6 +474,134 @@ def test_cancel_button_calls_the_cancel_endpoint(monkeypatch):
     cancel_buttons[0].click().run(timeout=15)
 
     assert any(c.endswith("/v1/runs/run-1/cancel") for c in captured_cancel_calls), captured_cancel_calls
+
+
+_USD_TRIP_RESULT = {
+    "status": "success",
+    "narrative": "A comfortable Istanbul trip.",
+    "observations": [
+        {"action": "search_flights", "status": "success", "envelope": {"result": {"options": [
+            {"carrier": "Turkish Airlines", "origin": "BEY", "destination": "IST", "depart_at": "2026-09-10T08:00:00+03:00",
+             "arrive_at": "2026-09-10T10:00:00+03:00", "stops": 0, "price": {"amount_minor_units": 135000, "currency": "USD"}},
+        ]}}},
+        {"action": "search_stays", "status": "success", "envelope": {"stays": [
+            {"rank": 1, "stay": {
+                "name": "Konforlu Konaklama", "district_id": "district_fatih", "side": "european",
+                "nightly_price": {"amount_minor_units": 35593, "currency": "TRY"},
+                # Deliberately no `coordinates` here: st_folium is a real
+                # JS-backed Streamlit component that hangs AppTest's own
+                # bare-mode execution (observed directly) -- the map
+                # popup's currency logic is covered separately below by a
+                # pure results.py-level test (no Streamlit involved), so
+                # this AppTest fixture stays map-free to keep the other
+                # currency-coverage tests fast and reliable.
+            }, "fair_price": {"estimated_fair_price": {"amount_minor_units": 40000, "currency": "TRY"}, "scoring_status": "complete"}},
+        ]}},
+    ],
+    "warnings": [],
+    "budget_summary": {
+        "budget": {"amount_minor_units": 500000, "currency": "USD"},
+        "fx_quote": {
+            "base_currency": "USD", "quote_currency": "TRY", "rate": "40.00", "effective_date": "2026-08-19",
+            "provider": "frankfurter.app (ECB reference rates)", "retrieved_at": "2026-08-20T12:00:00Z", "cache_status": "hit",
+        },
+        "fx_status": "success",
+        "cheapest_flight": {"raw": {"amount_minor_units": 135000, "currency": "USD"}, "normalized": {"amount_minor_units": 135000, "currency": "USD"}},
+        "cheapest_stay_total": {"raw": {"amount_minor_units": 106779, "currency": "TRY"}, "normalized": {"amount_minor_units": 2669, "currency": "USD"}},
+    },
+}
+
+
+def _run_usd_trip_and_collect_text(monkeypatch, tab_index: int):
+    def _fake_get(url, timeout=None):
+        if url.endswith("/health"):
+            return _JsonResponse(200, {"status": "ok", "service": "agent-system-a", "mode": "fixture"})
+        if "/v1/runs/" in url:
+            return _JsonResponse(200, {
+                "run_id": "run-1", "session_id": "session-1", "status": "completed",
+                "created_at": "t", "updated_at": "t", "result": _USD_TRIP_RESULT,
+            })
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+    monkeypatch.setattr(httpx, "post", lambda url, json=None, timeout=None: _JsonResponse(201, {"run_id": "run-1", "session_id": "session-1", "status": "pending"}))
+
+    at = AppTest.from_file(APP_PATH)
+    at.run(timeout=15)
+    at.button[0].click().run(timeout=15)
+    assert not at.exception
+
+    tab = at.tabs[tab_index]
+    texts = []
+    for element_list in (tab.markdown, tab.caption):
+        texts.extend(e.value for e in element_list)
+    return texts
+
+
+def test_usd_trip_flights_tab_shows_usd_as_primary_price(monkeypatch):
+    """Manual QA remediation Q.1 (second correction pass, §1): the flight
+    was already requested/priced natively in USD -- must render as USD,
+    never demoted to or mixed with TRY."""
+    texts = _run_usd_trip_and_collect_text(monkeypatch, tab_index=0)
+    price_lines = [t for t in texts if "Price:" in t]
+    assert price_lines, texts
+    assert any("USD" in t for t in price_lines)
+    assert not any("TRY" in t for t in price_lines)
+
+
+def test_usd_trip_stays_tab_shows_usd_as_primary_price_try_only_as_secondary(monkeypatch):
+    """The real accommodation price is TRY-native (Travel MCP) -- the
+    PRIMARY rendered price must be the normalized USD amount; the raw TRY
+    evidence must still be visible, but only as secondary/caption text,
+    never as the unlabeled headline figure."""
+    texts = _run_usd_trip_and_collect_text(monkeypatch, tab_index=1)
+    nightly_lines = [t for t in texts if t.startswith("Nightly price:")]
+    assert nightly_lines, texts
+    assert "USD" in nightly_lines[0]
+    fair_price_lines = [t for t in texts if t.startswith("Estimated fair price:")]
+    assert fair_price_lines
+    assert "USD" in fair_price_lines[0]
+    total_lines = [t for t in texts if "Total for" in t]
+    assert total_lines
+    assert "USD" in total_lines[0]
+    # The raw TRY amount is still disclosed somewhere (secondary evidence),
+    # just never as an unconverted headline figure.
+    assert any("Raw:" in t and "TRY" in t for t in texts)
+    # A savings/deal figure was rendered, in the trip's own currency.
+    savings_lines = [t for t in texts if "below the estimated fair price" in t or "above the estimated fair price" in t]
+    assert savings_lines
+    assert "USD" in savings_lines[0]
+
+
+def test_usd_trip_budget_tab_discloses_fx_rate_never_shows_bare_try_total(monkeypatch):
+    texts = _run_usd_trip_and_collect_text(monkeypatch, tab_index=4)
+    assert any("Exchange rate" in t and "USD" in t and "TRY" in t for t in texts)
+
+
+def test_usd_trip_map_popup_shows_usd_primary_price():
+    """Pure-logic check (results.py, no Streamlit needed -- st_folium
+    itself is a real JS-backed component that AppTest's bare mode can't
+    exercise): the map popup's price text must show the normalized USD
+    amount, with the raw TRY amount only as parenthetical secondary
+    detail."""
+    from phase6 import results as result_helpers
+
+    result_with_coordinates = dict(_USD_TRIP_RESULT)
+    result_with_coordinates["observations"] = [
+        dict(_USD_TRIP_RESULT["observations"][0]),
+        {"action": "search_stays", "status": "success", "envelope": {"stays": [
+            {"rank": 1, "stay": {
+                "name": "Konforlu Konaklama", "district_id": "district_fatih", "side": "european",
+                "nightly_price": {"amount_minor_units": 35593, "currency": "TRY"},
+                "coordinates": {"lat": 41.0, "lon": 28.9},
+            }, "fair_price": {"estimated_fair_price": {"amount_minor_units": 40000, "currency": "TRY"}, "scoring_status": "complete"}},
+        ]}},
+    ]
+    points = result_helpers.extract_map_points(result_with_coordinates)
+    assert points
+    pair = result_helpers.format_money_pair(points[0]["nightly_price_raw"], result_with_coordinates)
+    assert "USD" in pair["primary"]
+    assert pair["secondary"] and "TRY" in pair["secondary"]
 
 
 @pytest.mark.parametrize("terminal_status,expected_marker", [

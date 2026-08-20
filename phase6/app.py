@@ -14,10 +14,30 @@ from __future__ import annotations
 
 import time
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import streamlit as st
+
+# Manual QA remediation Q.1: the same project timezone convention as
+# phase4/guards.py::PROJECT_TIMEZONE (services/planner-a) -- "today" for
+# date-picker bounds is resolved here too, never the frontend container's
+# own local time, so the UI and the backend can never disagree about what
+# "today" or "in the past" means for the same wall-clock instant.
+_PROJECT_TIMEZONE = ZoneInfo("Europe/Istanbul")
+
+# Manual QA remediation Q.1 (user correction pass §B): TRY and USD --
+# genuine FX conversion exists now (providers/fx_frankfurter.py, a real
+# Frankfurter.app/ECB rate source, Decimal-exact, with full provenance;
+# orchestration/system_a/budget_summary.py applies it server-side). EUR
+# remains deferred: no EUR rate source was verified/wired. Keep in sync
+# with services/planner-a/phase4/guards.py::_SUPPORTED_CURRENCIES.
+_SUPPORTED_CURRENCIES = ["TRY", "USD"]
+
+
+def _project_today() -> date:
+    return datetime.now(timezone.utc).astimezone(_PROJECT_TIMEZONE).date()
 
 from phase6 import results as result_helpers
 from phase6.api_client import (
@@ -128,8 +148,43 @@ def _render_disclaimers() -> None:
 # --- trip request form -------------------------------------------------------------------
 
 
+_DEPART_DATE_KEY = "voyager_depart_date"
+_RETURN_DATE_KEY = "voyager_return_date"
+
+
+def _clamp_return_date_to_depart() -> None:
+    """`on_change` callback for the departure-date widget (Manual QA
+    remediation Q.1): runs before the script reruns and re-renders the
+    return-date widget below, so if the newly-chosen departure date would
+    put the already-stored return date before it, the stored return date
+    is pulled forward first -- this is what makes "changing departure
+    revalidates return" a live, immediate effect rather than something
+    only caught at submit time, and avoids Streamlit raising when a
+    widget's `min_value` moves past its own already-stored session value."""
+    depart = st.session_state.get(_DEPART_DATE_KEY)
+    current_return = st.session_state.get(_RETURN_DATE_KEY)
+    if depart is not None and current_return is not None and current_return < depart:
+        st.session_state[_RETURN_DATE_KEY] = depart
+
+
 def _render_trip_form() -> Optional[dict[str, Any]]:
     st.subheader("Plan your Istanbul trip")
+
+    today = _project_today()
+
+    # Deliberately OUTSIDE st.form: a plain widget reruns the script
+    # immediately on change (a form's own inputs only take effect on
+    # submit), which is what lets the return-date widget's `min_value`
+    # below track the live departure-date selection.
+    depart_date = st.date_input(
+        "Departure date",
+        value=max(today + timedelta(days=30), today),
+        min_value=today,
+        key=_DEPART_DATE_KEY,
+        on_change=_clamp_return_date_to_depart,
+        help="Cannot be earlier than today (Istanbul time).",
+    )
+
     with st.form("trip_form", clear_on_submit=False):
         col1, col2 = st.columns(2)
         with col1:
@@ -137,14 +192,37 @@ def _render_trip_form() -> Optional[dict[str, Any]]:
                 "Origin airport (IATA code)", value="BEY", max_chars=3,
                 help="3-letter IATA code, e.g. BEY for Beirut.",
             ).strip().upper()
-            depart_date = st.date_input("Departure date", value=date.today() + timedelta(days=30))
             traveler_count = st.number_input("Travelers", min_value=1, max_value=12, value=2, step=1)
             pace = st.selectbox("Pace", options=["relaxed", "moderate", "packed"], index=1)
         with col2:
             st.text_input("Destination", value="Istanbul (IST)", disabled=True, help="Istanbul is the only fully supported destination.")
-            return_date = st.date_input("Return date", value=date.today() + timedelta(days=35))
-            currency = st.selectbox("Currency", options=["TRY", "USD", "EUR"], index=0)
-            budget_amount = st.number_input(f"Budget ({currency})", min_value=1.0, value=5000.0, step=100.0)
+            return_date = st.date_input(
+                "Return date",
+                value=max(st.session_state.get(_RETURN_DATE_KEY, today + timedelta(days=35)), depart_date),
+                min_value=depart_date,
+                key=_RETURN_DATE_KEY,
+                help="Cannot be earlier than the departure date.",
+            )
+            currency = st.selectbox(
+                "Currency", options=_SUPPORTED_CURRENCIES, index=0,
+                help="TRY prices are native. USD amounts are converted using one real, live exchange rate per run — see the Budget and Sources tabs for the rate and its date.",
+            )
+            # Pre-commit stabilization: the label was previously
+            # f"Budget ({currency})" -- inside this st.form, changing the
+            # Currency selectbox above does not trigger an immediate
+            # rerun (form widgets only rerun on submit), so that label
+            # kept showing the PREVIOUS currency while the user was still
+            # interacting with the form, even though the value actually
+            # submitted was always correctly built from the live
+            # `currency` variable at submit time. A stable label sidesteps
+            # the misleading stale-currency display entirely; the caption
+            # states the rule once, plainly, instead of implying the label
+            # itself tracks the live selection.
+            budget_amount = st.number_input(
+                "Budget amount", min_value=1.0, value=5000.0, step=100.0,
+                help="Enter the amount in whichever currency you selected above.",
+            )
+            st.caption("Uses the currency selected above.")
             language = st.selectbox("Preferred language", options=["en", "tr", "ar"], index=0, help="Used for local-expertise citations where the underlying knowledge base supports it.")
 
         interests = st.multiselect(
@@ -167,6 +245,17 @@ def _render_trip_form() -> Optional[dict[str, Any]]:
 
     if len(origin) != 3 or not origin.isalpha():
         st.error("Origin airport must be a 3-letter IATA code.")
+        return None
+    # Defense in depth alongside the widgets' own min_value constraints
+    # above (Manual QA remediation Q.1): a page left open across a day
+    # boundary, or a widget value restored from stale session state,
+    # could still submit an out-of-range date even though the picker
+    # itself steers a live interaction away from one. The System A API
+    # re-validates these exact same rules server-side and rejects with a
+    # typed error before creating a run either way -- this is a fast,
+    # friendly local echo of that same validation, not the only guard.
+    if depart_date < today:
+        st.error("Departure date cannot be in the past.")
         return None
     if return_date < depart_date:
         st.error("Return date cannot be before the departure date.")
@@ -230,6 +319,24 @@ def _render_progress_log() -> None:
 # --- terminal-result rendering ------------------------------------------------------------
 
 
+def _render_money(label: str, money: Optional[dict], result: dict, *, bold: bool = True) -> None:
+    """The one shared rendering call for every price in the app (Manual
+    QA remediation Q.1, second correction pass, §1) -- always shows the
+    trip's own currency as the primary, headline number when
+    determinable, discloses the real raw provider-native amount as a
+    caption when it differs, and shows an explicit warning (never a
+    silently-mislabeled amount) when conversion was needed but
+    unavailable."""
+    pair = result_helpers.format_money_pair(money, result)
+    primary = f"**{pair['primary']}**" if bold else pair["primary"]
+    st.write(f"{label}: {primary}")
+    if pair["secondary"]:
+        st.caption(pair["secondary"])
+    if pair["conversion_unavailable"]:
+        target = result_helpers.get_target_currency(result)
+        st.caption(f"⚠️ Live {target} conversion unavailable for this amount — showing the real, original currency only.")
+
+
 def _render_flights(result: dict) -> None:
     options = result_helpers.extract_flight_options(result)
     if not options:
@@ -239,38 +346,133 @@ def _render_flights(result: dict) -> None:
         with st.container(border=True):
             st.markdown(f"**{opt.get('carrier', 'Unknown carrier')}** — {opt.get('origin', '?')} → {opt.get('destination', '?')}")
             st.write(f"Depart: {opt.get('depart_at', '—')}  ·  Arrive: {opt.get('arrive_at', '—')}  ·  Stops: {opt.get('stops', '—')}")
-            st.write(f"Price: **{result_helpers.format_money(opt.get('price'))}**")
+            _render_money("Price", opt.get("price"), result)
 
 
-def _render_stays(result: dict) -> None:
+def _render_stays(result: dict, trip_request: Optional[dict]) -> None:
     items = result_helpers.extract_stay_items(result)
     if not items:
         st.info("No accommodation results are available for this run.")
         return
     st.warning("Accommodation availability shown is a historical snapshot — never live availability.", icon="📦")
+    nights = result_helpers.nights_from_trip_request(trip_request)
     for item in items:
         stay = item.get("stay") or {}
         fair_price = item.get("fair_price") or {}
+        nightly_price = stay.get("nightly_price")
         with st.container(border=True):
             st.markdown(f"**{stay.get('name', 'Unnamed stay')}** ({stay.get('district_id', '—')}, {stay.get('side', '—')} side)")
-            st.write(f"Nightly price: **{result_helpers.format_money(stay.get('nightly_price'))}**  ·  Rank: {item.get('rank', '—')}")
-            if fair_price.get("estimated_fair_price"):
-                st.write(f"Estimated fair price: **{result_helpers.format_money(fair_price.get('estimated_fair_price'))}** ({fair_price.get('scoring_status', 'unknown')})")
+            _render_money("Nightly price", nightly_price, result)
+            st.caption(f"Rank: {item.get('rank', '—')}")
+
+            if isinstance(nightly_price, dict) and nightly_price.get("amount_minor_units") is not None and nights:
+                total_raw = {"amount_minor_units": nightly_price["amount_minor_units"] * nights, "currency": nightly_price.get("currency")}
+                _render_money(f"Total for {nights} night(s)", total_raw, result, bold=False)
+
+            fair_amount = fair_price.get("estimated_fair_price")
+            if isinstance(fair_amount, dict):
+                _render_money("Estimated fair price", fair_amount, result, bold=False)
+                st.caption(f"Scoring status: {fair_price.get('scoring_status', 'unknown')}")
+                _render_savings(nightly_price, fair_amount, result)
+
+
+def _render_savings(nightly_price: Optional[dict], fair_price: Optional[dict], result: dict) -> None:
+    """The deal/savings figure (Manual QA remediation Q.1, second
+    correction pass, §1) -- nightly price vs. estimated fair price,
+    computed only after both are normalized into the SAME currency (the
+    run's one FX quote, never a second call), so the comparison is never
+    between two different currencies. Silent (never a fabricated number)
+    if either side can't be normalized into a common currency."""
+    target = result_helpers.get_target_currency(result)
+    fx_quote = result_helpers.get_fx_quote(result)
+    if target is None:
+        # No trip-level currency context (e.g. no trip_request at all) --
+        # only compare directly when both are already the same currency.
+        if not (isinstance(nightly_price, dict) and isinstance(fair_price, dict)):
+            return
+        if str(nightly_price.get("currency")).upper() != str(fair_price.get("currency")).upper():
+            return
+        normalized_nightly, normalized_fair = nightly_price, fair_price
+    else:
+        normalized_nightly = result_helpers.normalize_money(nightly_price, target, fx_quote)
+        normalized_fair = result_helpers.normalize_money(fair_price, target, fx_quote)
+    if normalized_nightly is None or normalized_fair is None:
+        return
+    diff_minor_units = normalized_nightly["amount_minor_units"] - normalized_fair["amount_minor_units"]
+    diff_money = {"amount_minor_units": abs(diff_minor_units), "currency": normalized_nightly["currency"]}
+    if diff_minor_units < 0:
+        st.caption(f"💚 {result_helpers.format_money(diff_money)} below the estimated fair price.")
+    elif diff_minor_units > 0:
+        st.caption(f"🔺 {result_helpers.format_money(diff_money)} above the estimated fair price.")
+
+
+# Manual QA remediation Q.1: precise, honest per-status explanations --
+# never the bare, vague status code itself. "forecast_not_yet_available"
+# is the one that most needs a specific explanation (the manual-run
+# observation this fixes): a trip date beyond Open-Meteo's forecast
+# horizon is expected behavior, not a provider outage, and the UI should
+# say so with the exact date forecasts open up.
+_WEATHER_STATUS_MESSAGES = {
+    "unsupported": "Weather is not available for this request (an unsupported date range or location).",
+    "timeout": "Weather could not be retrieved right now — the forecast provider timed out. This is not a permanent failure; try again shortly.",
+    "rate_limited": "Weather could not be retrieved right now — the forecast provider is temporarily rate-limited. Try again shortly.",
+    "provider_error": "Weather could not be retrieved right now — the forecast provider returned an unexpected error.",
+    "unavailable": "Weather could not be retrieved right now — the forecast provider was temporarily unavailable.",
+    "cancelled": "The weather lookup was cancelled before it completed.",
+}
+
+
+def _render_forecast_days(days: list[dict]) -> None:
+    for day in days or []:
+        st.write(f"**{day.get('date', '—')}** — {day.get('condition', '—')}, high {day.get('high', '—')}° / low {day.get('low', '—')}°")
+
+
+def _render_historical_climate_days(weather: dict) -> None:
+    # User correction pass (§C): a future trip beyond the live forecast
+    # horizon gets real historical climate guidance -- always clearly
+    # labeled as an aggregate, never presented as if it were a forecast.
+    years = weather.get("years_sampled") or []
+    st.warning(weather.get("climate_disclaimer") or "Historical climate guidance — not a forecast.")
+    if years:
+        st.caption(f"Aggregated from {len(years)} prior year(s): {', '.join(str(y) for y in years)}.")
+    earliest = weather.get("earliest_available_forecast_date")
+    if earliest:
+        st.caption(f"A live forecast for this trip date opens up on **{earliest}**.")
+    for day in weather.get("historical_climate_days") or []:
+        st.write(
+            f"**{day.get('date', '—')}** (historical average) — {day.get('condition', '—')}, "
+            f"avg high {day.get('avg_high', '—')}° / avg low {day.get('avg_low', '—')}°"
+        )
 
 
 def _render_weather(result: dict) -> None:
     weather = result_helpers.extract_weather(result)
-    if not weather:
+    if weather:
+        kind = weather.get("kind")
+        if kind == "forecast":
+            _render_forecast_days(weather.get("forecast_days") or [])
+        elif kind == "current_observation":
+            obs = weather.get("observation") or {}
+            st.write(f"Current conditions: {obs.get('condition', '—')}")
+        elif kind == "historical":
+            _render_historical_climate_days(weather)
+        elif kind == "mixed":
+            st.caption("Coverage: live forecast for the reachable dates, historical climate guidance for the rest.")
+            st.write("**Live forecast**")
+            _render_forecast_days(weather.get("forecast_days") or [])
+            st.write("**Historical climate guidance**")
+            _render_historical_climate_days(weather)
+        else:
+            st.json(weather)
+        return
+
+    status_info = result_helpers.extract_weather_status(result)
+    if status_info is None:
         st.info("No weather results are available for this run.")
         return
-    if weather.get("kind") == "forecast":
-        for day in weather.get("forecast_days") or []:
-            st.write(f"**{day.get('date', '—')}** — {day.get('condition', '—')}, high {day.get('high', '—')}° / low {day.get('low', '—')}°")
-    elif weather.get("kind") == "current_observation":
-        obs = weather.get("observation") or {}
-        st.write(f"Current conditions: {obs.get('condition', '—')}")
-    else:
-        st.json(weather)
+
+    status = status_info.get("status")
+    st.info(_WEATHER_STATUS_MESSAGES.get(status, "No weather results are available for this run."))
 
 
 def _render_itinerary(result: dict) -> None:
@@ -291,10 +493,33 @@ def _render_itinerary(result: dict) -> None:
                 st.warning(warning)
 
 
+def _render_fx_disclosure(result: dict) -> None:
+    # Manual QA remediation Q.1 (§B): "the Budget and Sources tabs must
+    # disclose the FX source and rate date" -- always renders something
+    # explicit, including an honest degradation message when the FX
+    # provider failed rather than staying silent about it.
+    budget_summary = result.get("budget_summary") if isinstance(result, dict) else None
+    if not isinstance(budget_summary, dict):
+        return
+    quote = budget_summary.get("fx_quote")
+    if isinstance(quote, dict):
+        st.caption(
+            f"Exchange rate: 1 {quote['base_currency']} = {quote['rate']} {quote['quote_currency']} "
+            f"(as of {quote['effective_date']}, source: {quote['provider']}, retrieved {quote['retrieved_at']}, "
+            f"cache: {quote['cache_status']})."
+        )
+    elif budget_summary.get("fx_status") is not None:
+        st.warning(
+            f"A live exchange rate could not be obtained for this run (status: {budget_summary['fx_status']}) -- "
+            "amounts are shown in their real, original currency only, never a fabricated conversion."
+        )
+
+
 def _render_budget_chart(result: dict, trip_request: Optional[dict]) -> None:
     chart_data = result_helpers.build_budget_chart_data(result, trip_request)
     if chart_data is None:
         st.info("Not enough real numeric data was returned to build a cost overview for this run.")
+        _render_fx_disclosure(result)
         return
     try:
         import plotly.graph_objects as go
@@ -308,6 +533,7 @@ def _render_budget_chart(result: dict, trip_request: Optional[dict]) -> None:
     )
     st.plotly_chart(figure, width="stretch")
     st.caption("Built only from numeric values actually returned by this run — never estimated or invented.")
+    _render_fx_disclosure(result)
 
 
 def _render_map(result: dict) -> None:
@@ -325,9 +551,20 @@ def _render_map(result: dict) -> None:
     avg_lon = sum(p["lon"] for p in points) / len(points)
     fmap = folium.Map(location=[avg_lat, avg_lon], zoom_start=13)
     for point in points:
+        # Manual QA remediation Q.1 (second correction pass, §1): the
+        # popup's primary price is normalized into the trip's own
+        # currency (never a second FX call -- format_money_pair reuses
+        # the run's one already-fetched quote); the raw amount is kept
+        # visible in the popup text as secondary detail, never hidden.
+        pair = result_helpers.format_money_pair(point.get("nightly_price_raw"), result)
+        price_text = pair["primary"]
+        if pair["secondary"]:
+            price_text += f" ({pair['secondary']})"
+        elif pair["conversion_unavailable"]:
+            price_text += " (live conversion unavailable)"
         folium.Marker(
             location=[point["lat"], point["lon"]],
-            popup=f"{point['label']} — {point['nightly_price']}",
+            popup=f"{point['label']} — {price_text}",
             tooltip=point["label"],
         ).add_to(fmap)
     st_folium(fmap, use_container_width=True, height=420, returned_objects=[])
@@ -360,6 +597,8 @@ def _render_provenance_and_citations(result: dict) -> None:
     if not badges and not citations and not assumptions:
         st.info("No provenance or citation information is available for this run.")
 
+    _render_fx_disclosure(result)
+
 
 def _render_results(result: dict, trip_request: Optional[dict]) -> None:
     warnings = result_helpers.collect_warnings(result)
@@ -375,7 +614,7 @@ def _render_results(result: dict, trip_request: Optional[dict]) -> None:
     with tabs[0]:
         _render_flights(result)
     with tabs[1]:
-        _render_stays(result)
+        _render_stays(result, trip_request)
     with tabs[2]:
         _render_weather(result)
     with tabs[3]:
