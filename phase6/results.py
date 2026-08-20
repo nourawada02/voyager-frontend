@@ -168,6 +168,75 @@ def collect_itinerary_assumptions(result: Optional[dict[str, Any]]) -> list[str]
     return [a for a in itinerary.get("assumptions") or [] if isinstance(a, str)]
 
 
+def candidate_provenance_by_poi_id(result: Optional[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """`LocalItinerary.candidate_provenance` (RAG-FIRST SYSTEM B R.1;
+    additive, optional) indexed by poi_id -- empty dict when the field is
+    absent entirely (an itinerary payload produced before this
+    checkpoint), never fabricated."""
+    itinerary = extract_itinerary(result)
+    if not itinerary:
+        return {}
+    entries = itinerary.get("candidate_provenance")
+    if not isinstance(entries, list):
+        return {}
+    return {e["poi_id"]: e for e in entries if isinstance(e, dict) and isinstance(e.get("poi_id"), str)}
+
+
+def humanize_poi_id(poi_id: str) -> str:
+    """Deterministic last-resort label when no real display_name is
+    available (a catalog_fallback candidate never carries one, and an
+    older payload may carry no candidate_provenance at all) -- turns
+    'poi_hagia_sophia' into 'Hagia Sophia'. Never used when a real
+    display_name is present; this is presentation only, never a
+    substitute for real provenance data."""
+    if not isinstance(poi_id, str) or not poi_id:
+        return str(poi_id)
+    stripped = poi_id[len("poi_") :] if poi_id.startswith("poi_") else poi_id
+    words = [w for w in stripped.split("_") if w]
+    return " ".join(w.capitalize() for w in words) or poi_id
+
+
+def poi_display_name(poi_id: str, provenance_by_id: dict[str, dict[str, Any]]) -> str:
+    """The name to show a user for this POI -- never the raw poi_*
+    identifier as the primary label. Prefers the real display_name
+    carried on a 'rag'-origin candidate_provenance entry; falls back to
+    a humanized form of the id itself (never to the raw id string)."""
+    entry = provenance_by_id.get(poi_id)
+    if isinstance(entry, dict):
+        name = entry.get("display_name")
+        if isinstance(name, str) and name.strip():
+            return name
+    return humanize_poi_id(poi_id)
+
+
+def poi_origin_badge(poi_id: str, provenance_by_id: dict[str, dict[str, Any]]) -> Optional[str]:
+    """'RAG' or 'Catalog' -- or None when no provenance is known at all
+    (an itinerary payload from before candidate_provenance existed).
+    Never guesses an origin the API did not actually report."""
+    entry = provenance_by_id.get(poi_id)
+    if not isinstance(entry, dict):
+        return None
+    origin = entry.get("candidate_origin")
+    if origin == "rag":
+        return "RAG"
+    if origin == "catalog_fallback":
+        return "Catalog"
+    return None
+
+
+def poi_matched_interests_text(poi_id: str, provenance_by_id: dict[str, dict[str, Any]]) -> Optional[str]:
+    """Comma-joined matched_interests for this POI, or None when absent
+    (a catalog_fallback entry never carries this field, and a
+    'rag'-origin entry from before this checkpoint may not either)."""
+    entry = provenance_by_id.get(poi_id)
+    if not isinstance(entry, dict):
+        return None
+    matched = entry.get("matched_interests")
+    if not isinstance(matched, list) or not matched:
+        return None
+    return ", ".join(str(m) for m in matched if isinstance(m, str))
+
+
 def collect_provenance_badges(result: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
     """One badge per observation: action, status, data_mode (if known),
     provider (if known) -- drawn only from fields already present in the

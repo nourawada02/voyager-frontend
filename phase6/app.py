@@ -480,11 +480,33 @@ def _render_itinerary(result: dict) -> None:
     if not itinerary:
         st.info("No day-by-day itinerary is available for this run.")
         return
-    st.write(f"Recommended base: `{itinerary.get('recommended_base_candidate_id', '—')}`  ·  Side crossings: {itinerary.get('side_crossings', '—')}")
+    # RAG-FIRST SYSTEM B R.1 FINAL USER-TEST CLOSURE requirement 3: human-
+    # readable POI names, never a raw poi_* identifier as the primary UI
+    # label, plus a RAG/catalog origin badge and matched-interest text --
+    # all drawn only from candidate_provenance when the API actually
+    # returned it (older payloads without it still render: every POI
+    # falls back to a humanized form of its id, never the raw id).
+    provenance_by_id = result_helpers.candidate_provenance_by_poi_id(result)
+    st.write(
+        f"Recommended base: `{itinerary.get('recommended_base_candidate_id', '—')}`  ·  "
+        f"Side crossings: {itinerary.get('side_crossings', '—')}"
+    )
     for day in itinerary.get("daily_plans") or []:
         with st.expander(f"📅 {day.get('date', '—')} — {day.get('side', '—')} side", expanded=False):
             poi_ids = day.get("poi_ids") or []
-            st.write("Points of interest: " + (", ".join(f"`{p}`" for p in poi_ids) if poi_ids else "—"))
+            if poi_ids:
+                for poi_id in poi_ids:
+                    name = result_helpers.poi_display_name(poi_id, provenance_by_id)
+                    badge = result_helpers.poi_origin_badge(poi_id, provenance_by_id)
+                    matched = result_helpers.poi_matched_interests_text(poi_id, provenance_by_id)
+                    line = f"**{name}**"
+                    if badge:
+                        line += f"  `{badge}`"
+                    if matched:
+                        line += f"  — matches: {matched}"
+                    st.markdown("- " + line)
+            else:
+                st.write("Points of interest: —")
             st.write(
                 f"Walking: {day.get('walking_minutes', '—')} min · Transfers: {day.get('transfer_minutes', '—')} min "
                 f"· Activities: {day.get('activity_minutes', '—')} min · Slack: {day.get('slack_minutes', '—')} min"

@@ -108,6 +108,84 @@ def test_extract_fair_price_items_pulls_from_nested_stay_items():
     assert items[0]["estimated_fair_price"]["amount_minor_units"] == 230000
 
 
+# --- RAG-FIRST SYSTEM B R.1 FINAL USER-TEST CLOSURE: human-readable POI
+# names, RAG/catalog badge, matched-interest text --------------------------
+
+_ITINERARY_WITH_PROVENANCE_ENVELOPE = {
+    **ITINERARY,
+    "selected_poi_ids": ["poi_hagia_sophia", "poi_camlica_hill"],
+    "candidate_provenance": [
+        {
+            "poi_id": "poi_hagia_sophia", "candidate_origin": "rag",
+            "display_name": "آيا صوفيا",  # Arabic display name -- see mojibake test below
+            "matched_interests": ["history", "religious_heritage"],
+            "source_id": "wiki_ar_hagia_sophia", "chunk_id": "chunk_abc123",
+            "retrieval_query": "مواقع تاريخية وتاريخ إسطنبول", "retrieval_score": 0.87,
+        },
+        {"poi_id": "poi_camlica_hill", "candidate_origin": "catalog_fallback"},
+    ],
+}
+
+ITINERARY_WITH_PROVENANCE = {
+    "observations": [
+        {
+            "action": "call_istanbul_expert", "status": "success", "fingerprint": "fp4",
+            "envelope": _ITINERARY_WITH_PROVENANCE_ENVELOPE, "warnings": [],
+        },
+    ],
+}
+
+
+def test_poi_display_name_is_never_the_raw_poi_id():
+    """Requirement 5, test 1: raw poi_* IDs are not the primary UI label
+    -- true both when a real display_name exists (a 'rag'-origin entry)
+    and when it doesn't (catalog_fallback, or no provenance at all)."""
+    provenance = results.candidate_provenance_by_poi_id(ITINERARY_WITH_PROVENANCE)
+    assert results.poi_display_name("poi_hagia_sophia", provenance) == "آيا صوفيا"
+    # catalog_fallback has no display_name -- falls back to a humanized
+    # label, never the raw "poi_camlica_hill" string itself.
+    fallback_name = results.poi_display_name("poi_camlica_hill", provenance)
+    assert fallback_name != "poi_camlica_hill"
+    assert fallback_name == "Camlica Hill"
+    # No provenance at all (an old-shape itinerary) -- still never the raw id.
+    no_provenance_name = results.poi_display_name("poi_grand_bazaar", {})
+    assert no_provenance_name != "poi_grand_bazaar"
+    assert no_provenance_name == "Grand Bazaar"
+
+
+def test_poi_origin_badge_reflects_real_candidate_origin():
+    provenance = results.candidate_provenance_by_poi_id(ITINERARY_WITH_PROVENANCE)
+    assert results.poi_origin_badge("poi_hagia_sophia", provenance) == "RAG"
+    assert results.poi_origin_badge("poi_camlica_hill", provenance) == "Catalog"
+    assert results.poi_origin_badge("poi_unknown", provenance) is None  # never guessed
+
+
+def test_poi_matched_interests_text_only_present_for_rag_origin():
+    provenance = results.candidate_provenance_by_poi_id(ITINERARY_WITH_PROVENANCE)
+    assert results.poi_matched_interests_text("poi_hagia_sophia", provenance) == "history, religious_heritage"
+    assert results.poi_matched_interests_text("poi_camlica_hill", provenance) is None
+
+
+def test_arabic_display_name_renders_without_mojibake():
+    """Requirement 5, test 3: a real Arabic display_name round-trips
+    exactly through candidate_provenance_by_poi_id/poi_display_name --
+    no double-encoding, no replacement characters, no corruption."""
+    provenance = results.candidate_provenance_by_poi_id(ITINERARY_WITH_PROVENANCE)
+    name = results.poi_display_name("poi_hagia_sophia", provenance)
+    assert name == "آيا صوفيا"
+    assert "�" not in name  # U+FFFD REPLACEMENT CHARACTER -- the mojibake tell
+    assert name.encode("utf-8").decode("utf-8") == name  # a clean UTF-8 round trip
+
+
+def test_candidate_provenance_by_poi_id_empty_for_old_payload_without_the_field():
+    """An itinerary produced before this checkpoint (no
+    candidate_provenance key at all) must not crash -- every lookup
+    degrades to 'no provenance known', never a KeyError."""
+    assert results.candidate_provenance_by_poi_id({"observations": [
+        {"action": "call_istanbul_expert", "status": "success", "envelope": ITINERARY, "warnings": []},
+    ]}) == {}
+
+
 # --- missing optional sections never crash ------------------------------------------------
 
 
